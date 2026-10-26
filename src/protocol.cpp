@@ -147,8 +147,6 @@ Options options(const Json &config) {
     o.simulation_distance = p.value("simulationDistanceChunks", 10);
     o.prefilter = p.value("prefilterLimit", 200000);
     o.scan_backend = p.value("scanBackend", std::string("auto"));
-    if (o.version.starts_with("1.19") && o.version != "1.19.4")
-        throw std::invalid_argument("地形模式支持1.19.4至1.21.11及26.1至26.3正式版");
     if (o.radius < 1 || o.radius > 60000000 || std::abs(int64_t(o.center_x)) > 29999999 ||
         std::abs(int64_t(o.center_z)) > 29999999 || o.threads < 1 || o.threads > 32 || o.limit < 1 || o.limit > 200 ||
         o.min_geodes < 1 || o.min_budding < 0 || o.prefilter < 0 || o.simulation_distance < 2 ||

@@ -55,7 +55,11 @@ enum class Op {
     Div,
     Negate,
     Lerp,
-    Surface
+    Surface,
+    Float,
+    Ridge118,
+    Slide118,
+    Blended118
 };
 
 struct Node {
@@ -78,6 +82,7 @@ struct NoiseSpec {
 
 #include "terrain_data.hpp"
 #include "terrain263_data.hpp"
+#include "terrain118_data.hpp"
 
 namespace geode {
 namespace {
@@ -251,6 +256,8 @@ struct Cell {
 }
 
 struct Terrain::Impl {
+    const std::vector<Node> &nodes;
+    const std::vector<SplinePoint> &spline_points;
     std::vector<Normal> noises;
     std::vector<Blended> blends;
     std::vector<Entry> cache;
@@ -280,13 +287,17 @@ struct Terrain::Impl {
     std::unordered_map<uint64_t, SamplingBound> sampling_bounds;
 
     explicit Impl(uint64_t seed, int generation)
-        : carver(seed), seed(seed), generation(generation), geodes(seed, generation) {
+        : nodes(uses_118_terrain(generation) ? terrain118_data::nodes : terrain_data::nodes),
+          spline_points(uses_118_terrain(generation) ? terrain118_data::points : terrain_data::points),
+          carver(seed), seed(seed), generation(generation), geodes(seed, generation) {
         Xoroshiro random;
         xSetSeed(&random, seed);
         uint64_t lo = xNextLong(&random), hi = xNextLong(&random);
-        for (auto &spec : generation >= 5 ? terrain263_data::noises : terrain_data::noises)
+        for (auto &spec : uses_118_terrain(generation) ? terrain118_data::noises :
+                         generation >= 5 ? terrain263_data::noises : terrain_data::noises)
             noises.emplace_back(spec, Xoroshiro{lo ^ spec.lo, hi ^ spec.hi}, generation >= 5);
-        for (auto params : generation >= 5 ? terrain263_data::blends : terrain_data::blends)
+        for (auto params : uses_118_terrain(generation) ? terrain118_data::blends :
+                           generation >= 5 ? terrain263_data::blends : terrain_data::blends)
             blends.emplace_back(Xoroshiro{lo ^ terrain_data::terrain_hash[0], hi ^ terrain_data::terrain_hash[1]},
                                 params);
         Xoroshiro aq{lo ^ terrain_data::aquifer_hash[0], hi ^ terrain_data::aquifer_hash[1]};
@@ -301,7 +312,7 @@ struct Terrain::Impl {
     double eval(int id, int x, int y, int z) {
         if (generation >= 5)
             return eval263(id, x, y, z);
-        auto &n = terrain_data::nodes[id];
+        auto &n = nodes[id];
         if (n.op == Op::Constant)
             return n.p;
         if (n.op == Op::Cache2D && interpolate)
@@ -313,9 +324,7 @@ struct Terrain::Impl {
             y = 0;
             z = floor_div(z, 4) * 4;
         }
-        Key key{id + int(terrain_data::nodes.size()) * (aquifer_eval  ? 2
-                                                        : interpolate ? 0
-                                                                      : 1),
+        Key key{id + int(nodes.size()) * (aquifer_eval ? 2 : interpolate ? 0 : 1),
                 x, y, z, aquifer_eval ? geode::key(context_x, context_z) : 0};
         size_t slot = Hash{}(key) & (cache.size() - 1);
         if (cache[slot].key == key)
@@ -412,6 +421,26 @@ struct Terrain::Impl {
             case Op::Blended:
                 result = blends[n.a].sample(x, y, z);
                 break;
+            case Op::Blended118:
+                result = blends[n.a].sample(floor_div(x, 4) * 4, floor_div(y, 8) * 8, floor_div(z, 4) * 4);
+                break;
+            case Op::Float:
+                result = float(a());
+                break;
+            case Op::Ridge118: {
+                float value = float(a());
+                result = -(std::abs(std::abs(value) - 0.6666667f) - 0.33333334f) * 3.0f;
+                break;
+            }
+            case Op::Slide118: {
+                auto slide = [](double target, double value, double alpha) {
+                    return alpha <= 0 ? target : alpha >= 1 ? value : lerp(alpha, target, value);
+                };
+                int cell_y = y / 8 - n.b;
+                result = slide(n.p, a(), (n.c - cell_y - n.r) / n.q);
+                result = slide(n.s, result, double(cell_y) / n.d);
+                break;
+            }
             case Op::Cache2D:
             case Op::FlatCache:
                 result = a();
@@ -435,7 +464,7 @@ struct Terrain::Impl {
             }
             case Op::Spline: {
                 float input = float(a());
-                auto begin = terrain_data::points.data() + n.b;
+                auto begin = spline_points.data() + n.b;
                 int count = n.c, index = -1;
                 while (index + 1 < count && input >= begin[index + 1].location)
                     ++index;
@@ -636,7 +665,8 @@ struct Terrain::Impl {
             height = -64;
         }
         for (int y = top; y >= -64; y -= 8)
-            if (eval(terrain_data::initial_density_without_jaggedness, x, y, z) > 0.390625) {
+            if (eval(uses_118_terrain(generation) ? terrain118_data::initial_density_without_jaggedness :
+                     terrain_data::initial_density_without_jaggedness, x, y, z) > 0.390625) {
                 height = y;
                 break;
             }
@@ -669,30 +699,37 @@ struct Terrain::Impl {
         }
         double wet = -1, full = -1;
         bool excluded = generation >= 5 ? eval263(terrain263_data::exclusion, x, y, z) > 0
-                                        : eval(terrain_data::erosion, x, y, z) < -0.22499999403953552 &&
+                                        : !uses_118_terrain(generation) &&
+                                              eval(terrain_data::erosion, x, y, z) < -0.22499999403953552 &&
                                               eval(terrain_data::depth, x, y, z) > 0.8999999761581421;
         if (!excluded) {
             double water = under_water ? 1.0 - std::clamp((lowest + 8 - y) / 64.0, 0.0, 1.0) : 0.0;
             double noise = std::clamp(
-                eval(generation >= 5 ? terrain263_data::fluid_level_floodedness : terrain_data::fluid_level_floodedness,
+                eval(uses_118_terrain(generation) ? terrain118_data::fluid_level_floodedness :
+                     generation >= 5 ? terrain263_data::fluid_level_floodedness : terrain_data::fluid_level_floodedness,
                      x, y, z),
                 -1.0, 1.0);
             wet = noise - lerp(1 - water, -0.8, 0.4);
             full = noise - lerp(1 - water, -0.3, 0.8);
         }
-        int level = -32512;
+        int level = -32512, spread_level = -32512;
         if (full > 0)
             level = result.level;
         else if (wet > 0) {
             int gx = floor_div(x, 16), gy = floor_div(y, 40), gz = floor_div(z, 16);
             double spread =
-                eval(generation >= 5 ? terrain263_data::fluid_level_spread : terrain_data::fluid_level_spread, gx, gy,
+                eval(uses_118_terrain(generation) ? terrain118_data::fluid_level_spread :
+                     generation >= 5 ? terrain263_data::fluid_level_spread : terrain_data::fluid_level_spread, gx, gy,
                      gz) *
                 10;
-            level = std::min(lowest, gy * 40 + 20 + int(std::floor(spread / 3)) * 3);
+            spread_level = gy * 40 + 20 + int(std::floor(spread / 3)) * 3;
+            level = std::min(lowest, spread_level);
         }
-        if (level <= -10 && level != -32512 && result.type != 2 &&
-            std::abs(eval(generation >= 5 ? terrain263_data::lava : terrain_data::lava, floor_div(x, 64),
+        // 1.18以截断到地表前的扩散高度选流体；新版使用最终高度。
+        int lava_level = uses_118_terrain(generation) ? spread_level : level;
+        if (lava_level <= -10 && lava_level != -32512 && result.type != 2 &&
+            std::abs(eval(uses_118_terrain(generation) ? terrain118_data::lava :
+                          generation >= 5 ? terrain263_data::lava : terrain_data::lava, floor_div(x, 64),
                           floor_div(y, 40), floor_div(z, 64))) > 0.3)
             result.type = 2;
         result.level = level;
@@ -739,13 +776,17 @@ struct Terrain::Impl {
         double noise = 0;
         if (p >= -2 && p <= 2) {
             if (std::isnan(barrier))
-                barrier = eval(generation >= 5 ? terrain263_data::barrier : terrain_data::barrier, x, y, z);
+                barrier = eval(uses_118_terrain(generation) ? terrain118_data::barrier :
+                               generation >= 5 ? terrain263_data::barrier : terrain_data::barrier, x, y, z);
             noise = barrier;
         }
         return 2 * (noise + p);
     }
 
     bool aquifer_solid(int x, int y, int z, double density) {
+        // 旧采样器在基础密度触及-64时直接使用全局流体，不再施加含水层压力。
+        if (generation == -2 && density <= -11.0 / 24 && eval(terrain118_data::base_density, x, y, z) <= -64)
+            return false;
         if (density > 0)
             return true;
         if (global(y).at(y) == 2)
@@ -811,7 +852,10 @@ struct Terrain::Impl {
         Fluid a = status(nearest[0]);
         double sim = similarity(distances[0], distances[1]);
         bool solid = false;
-        if (sim > 0 && !(a.at(y) == 1 && global(y - 1).at(y - 1) == 2)) {
+        if (generation == -2 && a.at(y) == 1 && global(y - 1).at(y - 1) == 2) {
+            // 1.18/1.18.1在全局水/岩浆接缝加密度1，1.18.2起直接保留流体。
+            solid = density + 1 > 0;
+        } else if (sim > 0 && !(a.at(y) == 1 && global(y - 1).at(y - 1) == 2)) {
             double barrier = std::nan("");
             Fluid b = status(nearest[1]);
             solid = density + sim * pressure(x, y, z, a, b, barrier) > 0;
@@ -832,12 +876,14 @@ Terrain::Terrain(uint64_t seed, int generation) : impl_(std::make_unique<Impl>(s
 Terrain::~Terrain() = default;
 
 double Terrain::density(int x, int y, int z) {
-    return impl_->eval(impl_->generation >= 5 ? terrain263_data::root : terrain_data::root, x, y, z);
+    return impl_->eval(uses_118_terrain(impl_->generation) ? terrain118_data::root :
+                       impl_->generation >= 5 ? terrain263_data::root : terrain_data::root, x, y, z);
 }
 
 double Terrain::raw_density(int x, int y, int z) {
     impl_->interpolate = false;
-    double v = impl_->eval(impl_->generation >= 5 ? terrain263_data::root : terrain_data::root, x, y, z);
+    double v = impl_->eval(uses_118_terrain(impl_->generation) ? terrain118_data::root :
+                          impl_->generation >= 5 ? terrain263_data::root : terrain_data::root, x, y, z);
     impl_->interpolate = true;
     return v;
 }
@@ -857,7 +903,7 @@ bool Terrain::carved(int x, int y, int z) {
 bool Terrain::overwritten(int x, int y, int z) {
     if (bedrock(x, y, z))
         return true;
-    if (!impl_->generation)
+    if (impl_->generation <= 0)
         return false;
     if (!impl_->structures)
         impl_->structures = std::make_unique<Structures>(impl_->seed, impl_->generation);

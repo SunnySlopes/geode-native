@@ -407,13 +407,16 @@ void set_version(Options &o, const std::string &text) {
             throw std::invalid_argument("Invalid Minecraft patch");
     }
     bool supported =
-        a == 1 && b >= 19 && b <= 21 && c >= 0 && !(b == 19 && c > 4) && !(b == 20 && c > 6) && !(b == 21 && c > 11);
+        a == 1 && b >= 18 && b <= 21 && c >= 0 && !(b == 18 && c > 2) && !(b == 19 && c > 4) &&
+        !(b == 20 && c > 6) && !(b == 21 && c > 11);
     supported = supported || (a == 26 && ((b == 1 && c >= 0 && c <= 2) || ((b == 2 || b == 3) && c == 0)));
     if (!in.eof() || !supported)
-        throw std::invalid_argument("Generation profile supports 1.19..1.21.11 and released 26.1..26.3 only");
+        throw std::invalid_argument("Generation profile supports 1.18..1.21.11 and released 26.1..26.3 only");
     o.version = text;
     o.modern = a == 26 || (b == 21 && c >= 5);
-    o.generation = a == 26 ? (b >= 3 ? 5 : 4) : b < 21 ? 0 : c <= 1 ? 1 : c >= 9 ? 4 : 2;
+    // 1.18/1.18.1保留半格距离和旧含水层接缝；1.19.4起晶洞改用精确倒平方根。
+    o.generation = a == 26 ? (b >= 3 ? 5 : 4) : b == 18 ? (c < 2 ? -2 : -1) :
+                   b == 19 && c < 4 ? -3 : b < 21 ? 0 : c <= 1 ? 1 : c >= 9 ? 4 : 2;
 }
 
 bool active(const Options &o, int px, int pz, int cx, int cz) {

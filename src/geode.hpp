@@ -7,6 +7,9 @@
 namespace geode {
 class Terrain;
 constexpr int world_min_chunk = -1875000, world_max_chunk = 1874999;
+constexpr bool uses_118_terrain(int generation) {
+    return generation == -2 || generation == -1;
+}
 int floor_div(int x, int divisor);
 uint64_t key(int x, int z);
 int key_x(uint64_t value);

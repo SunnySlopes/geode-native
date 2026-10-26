@@ -181,6 +181,9 @@ bool Structures::trial_written(int x, int y, int z) {
 }
 
 double Structures::beard(int x, int y, int z) {
+    // 1.18没有远古城市或试炼密室，不套用后续版本的结构地形适配。
+    if (uses_118_terrain(impl_->generation))
+        return 0;
     const auto &pieces = impl_->beard_pieces(floor_div(x, 16), floor_div(z, 16), true);
     double value = 0;
     for (const auto &p : pieces) {
@@ -192,7 +195,7 @@ double Structures::beard(int x, int y, int z) {
     for (const auto &p : pieces)
         for (auto j : p.junctions)
             value += contribution(x - j.x, y - j.y, z - j.z, y - j.y) * 0.4;
-    if (impl_->generation) {
+    if (impl_->generation > 0) {
         const auto &trials = impl_->beard_pieces(floor_div(x, 16), floor_div(z, 16), false);
         for (const auto &p : trials) {
             double dx = std::max({0, p.box.lo.x - x, x - p.box.hi.x}) / 2.0,

@@ -106,6 +106,8 @@ if(BUILD_TESTING)
                                          $<TARGET_FILE:geode-finder>)
         add_test(NAME terrain COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/terrain_check.py
                                       $<TARGET_FILE:geode-terrain-check> $<TARGET_FILE:geode-finder>)
+        add_test(NAME early-versions COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/early_version_check.py
+                                             $<TARGET_FILE:geode-terrain-check> $<TARGET_FILE:geode-finder>)
         add_test(NAME world COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/world_check.py
                                     $<TARGET_FILE:geode-terrain-check> $<TARGET_FILE:geode-finder>)
         add_test(NAME hotspot-quality COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/hotspot_check.py

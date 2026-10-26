@@ -250,20 +250,39 @@ struct Field {
     }
 };
 
-const std::array<double, 4096> &inverse_sqrt() {
-    static const auto table = [] {
+const std::array<double, 4096> &inverse_sqrt(bool legacy, bool half_offset) {
+    auto build = [](bool old, bool half) {
         std::array<double, 4096> a{};
-        for (int i = 1; i < 4096; ++i)
-            a[i] = 1.0 / std::sqrt(double(i));
+        for (int i = 1; i < 4096; ++i) {
+            // 1.18/1.18.1从方块中心计算距离：(dx+0.5)^2三项的常数和为0.75。
+            double v = double(i) + (half ? 0.75 : 0);
+            if (old) {
+                // 1.19.3及以前使用一次牛顿迭代；改成精确平方根会改变壳层和后续RNG。
+                double estimate =
+                    std::bit_cast<double>(6910469410427058090ULL - (std::bit_cast<uint64_t>(v) >> 1));
+                a[i] = estimate * (1.5 - 0.5 * v * estimate * estimate);
+            } else {
+                a[i] = 1.0 / std::sqrt(v);
+            }
+        }
         return a;
-    }();
+    };
+    if (half_offset) {
+        static const auto table = build(true, true);
+        return table;
+    }
+    if (legacy) {
+        static const auto table = build(true, false);
+        return table;
+    }
+    static const auto table = build(false, false);
     return table;
 }
 
-const std::vector<double> &radial_fields() {
-    static const auto table = [] {
+const std::vector<double> &radial_fields(bool legacy, bool half_offset) {
+    auto build = [](bool old, bool half) {
         std::vector<double> a(54 * 33 * 33 * 33);
-        auto &inv = inverse_sqrt();
+        auto &inv = inverse_sqrt(old, half);
         for (int px = 4; px <= 6; ++px)
             for (int py = 4; py <= 6; ++py)
                 for (int pz = 4; pz <= 6; ++pz)
@@ -274,22 +293,33 @@ const std::vector<double> &radial_fields() {
                             for (int y = -16; y <= 16; ++y)
                                 for (int x = -16; x <= 16; ++x) {
                                     int dx = x - px, dy = y - py, dz = z - pz;
-                                    a[i++] = inv[dx * dx + dy * dy + dz * dz + offset];
+                                    a[i++] = inv[dx * dx + dy * dy + dz * dz + offset + (half ? dx + dy + dz : 0)];
                                 }
                     }
         return a;
-    }();
+    };
+    if (half_offset) {
+        static const auto table = build(true, true);
+        return table;
+    }
+    if (legacy) {
+        static const auto table = build(true, false);
+        return table;
+    }
+    static const auto table = build(false, false);
     return table;
 }
 }
 
 struct Simulator::Impl {
     uint64_t seed, x_scale, z_scale;
-    bool float_noise;
+    bool float_noise, legacy_shape, half_offset;
     Random random;
     Field field;
 
-    explicit Impl(uint64_t s, int generation) : seed(s), float_noise(generation >= 5), random(s), field(s) {
+    explicit Impl(uint64_t s, int generation)
+        : seed(s), float_noise(generation >= 5), legacy_shape(generation < 0), half_offset(generation == -2),
+          random(s), field(s) {
         x_scale = (random.java_long() | 1) * 16;
         z_scale = (random.java_long() | 1) * 16;
     }
@@ -377,19 +407,19 @@ Material Simulator::material(const GeodeShape &s, Block point) const {
         impl_->float_noise
             ? impl_->field.sample263(point.x, point.y, point.z)
             : (sample(impl_->field.first, 1) + sample(impl_->field.second, 1.0181268882175227)) * (5.0 / 6.0) * 0.05;
-    auto &inv = inverse_sqrt();
+    auto &inv = inverse_sqrt(impl_->legacy_shape, impl_->half_offset);
     double shell = 0;
     for (int i = 0; i < s.count; ++i) {
         auto p = s.points[i];
         int dx = x - p.x, dy = y - p.y, dz = z - p.z;
-        shell += inv[dx * dx + dy * dy + dz * dz + p.offset];
+        shell += inv[dx * dx + dy * dy + dz * dz + p.offset + (impl_->half_offset ? dx + dy + dz : 0)];
     }
-    if (impl_->float_noise) {
+    if (impl_->float_noise || impl_->legacy_shape) {
         shell = 0;
         for (int i = 0; i < s.count; ++i) {
             auto p = s.points[i];
             int dx = x - p.x, dy = y - p.y, dz = z - p.z;
-            shell += inv[dx * dx + dy * dy + dz * dz + p.offset] + noise;
+            shell += inv[dx * dx + dy * dy + dz * dz + p.offset + (impl_->half_offset ? dx + dy + dz : 0)] + noise;
         }
     } else
         shell += noise * s.count;
@@ -402,7 +432,7 @@ Material Simulator::material(const GeodeShape &s, Block point) const {
         int dx = x - s.crack_x, dz = z - s.crack_z;
         for (int height : {7, 5, 1}) {
             int dy = y - height;
-            crack += inv[dx * dx + dy * dy + dz * dz + 2];
+            crack += inv[dx * dx + dy * dy + dz * dz + 2 + (impl_->half_offset ? dx + dy + dz : 0)];
         }
         crack += noise * 3;
         if (crack >= s.crack_limit)
@@ -465,10 +495,10 @@ Simulation Simulator::generate(int cx, int cz, Terrain *terrain) {
                 hi = std::max(hi, bound.hi);
             row_noise_hi[z][y] = hi;
         }
-    auto &inv = inverse_sqrt();
+    auto &inv = inverse_sqrt(impl_->legacy_shape, impl_->half_offset);
     result.budding.reserve(96);
     const double *radial[4]{};
-    auto &fields = radial_fields();
+    auto &fields = radial_fields(impl_->legacy_shape, impl_->half_offset);
     for (int i = 0; i < n; ++i) {
         auto p = points[i];
         int field = (((p.x - 4) * 3 + p.y - 4) * 3 + p.z - 4) * 2 + p.offset - 1;
@@ -502,7 +532,7 @@ Simulation Simulator::generate(int cx, int cz, Terrain *terrain) {
                                    : (impl_->field.first.sample(a.x[x + 16], a.y[y + 16], a.z[z + 16]) +
                                       impl_->field.second.sample(b.x[x + 16], b.y[y + 16], b.z[z + 16])) *
                                          (5.0 / 6.0) * 0.05;
-                if (impl_->float_noise) {
+                if (impl_->float_noise || impl_->legacy_shape) {
                     shell = 0;
                     for (int i = 0; i < n; ++i)
                         shell += radial[i][row + x + 16] + noise;
@@ -515,7 +545,7 @@ Simulation Simulator::generate(int cx, int cz, Terrain *terrain) {
                     int dx = x - crack_x, dz = z - crack_z;
                     for (int height : {7, 5, 1}) {
                         int dy = y - height;
-                        crack += inv[dx * dx + dy * dy + dz * dz + 2];
+                        crack += inv[dx * dx + dy * dy + dz * dz + 2 + (impl_->half_offset ? dx + dy + dz : 0)];
                     }
                     crack += noise * 3;
                 }

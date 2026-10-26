@@ -69,8 +69,6 @@ Json sample_json(const Json &query, Options base) {
         set_version(base, query.at("version").get<std::string>());
     if (query.contains("simulationDistance"))
         base.simulation_distance = query.at("simulationDistance").get<int>();
-    if (base.terrain && base.version.starts_with("1.19") && base.version != "1.19.4")
-        throw std::invalid_argument("Native terrain profile requires 1.19.4 or later");
     if (base.simulation_distance < 2 || base.simulation_distance > 32)
         throw std::invalid_argument("Simulation distance must be 2..32");
     if (query.contains("playerX")) {
@@ -107,7 +105,7 @@ int run(int argc, char **argv) {
         }
         if (args.contains("--help")) {
             std::cout
-                << "geode-finder --seed <int64> --version <1.19..1.21.11|26.1..26.3> --radius <blocks> [--shape circle|square] [--threads 8] [--prefilter-limit 50000] [--output results]\n"
+                << "geode-finder --seed <int64> --version <1.18..1.21.11|26.1..26.3> --radius <blocks> [--shape circle|square] [--threads 8] [--prefilter-limit 50000] [--output results]\n"
                 << "  --tick-radius 128 --simulation-distance 10 --min-geodes 1 --min-budding 1 --limit 100 --model terrain|stone\n"
                 << "  --prefilter-limit 0: exhaustive player-chunk candidates in the selected model\n"
                 << "  --scan-backend auto|cpu|gpu: optional OpenCL coarse scan for large finite-budget searches\n"
@@ -170,9 +168,6 @@ int run(int argc, char **argv) {
         if (model != "stone" && model != "terrain")
             throw std::invalid_argument("Model must be stone or terrain");
         o.terrain = model == "terrain";
-        if (o.terrain && o.version.starts_with("1.19") && o.version != "1.19.4")
-            throw std::invalid_argument(
-                "Native terrain profile supports 1.19.4..1.21.11; earlier 1.19 releases require their older geometry baseline (--model stone is Java compatibility only)");
         if (o.radius < 1 || o.radius > 60000000 || std::abs(int64_t(o.center_x)) > 30000000 ||
             std::abs(int64_t(o.center_z)) > 30000000 || o.threads < 1 || o.threads > 64 || o.tick_radius < 1 ||
             o.tick_radius > 1024 || o.simulation_distance < 2 || o.simulation_distance > 32 || o.prefilter < 0 ||
