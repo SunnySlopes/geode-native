@@ -798,6 +798,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
             progress("scan", scanned, scanned);
     } else {
         bool gpu = false;
+        std::string gpu_failure;
         // 约十亿区块以下，GPU初始化和首次回传会抵消较多计算收益。
         std::vector<Candidate> gpu_correct, gpu_legacy;
         const uint64_t chunks = uint64_t(maxx - minx + 1) * (maxz - minz + 1);
@@ -833,8 +834,9 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                     saved.scan_commit(size_t(id), covered, true, gpu_correct, gpu_legacy);
                     gpu_correct.clear();
                     gpu_legacy.clear();
-                });
-            if (backend) backend(gpu ? "gpu" : "cpu");
+                },
+                &gpu_failure, [&](const std::string &device) { if (backend) backend("gpu", device); });
+            if (backend && !gpu) backend("cpu", gpu_failure);
             if (!gpu && (o.scan_backend == "gpu" || partial_gpu))
                 throw std::runtime_error(
                     "No compatible OpenCL GPU for this footprint/checkpoint; use a separate CPU checkpoint");
