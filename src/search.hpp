@@ -119,7 +119,8 @@ struct Results {
 };
 
 using Progress = std::function<void(const std::string &, uint64_t, uint64_t)>;
-Results search(const Options &o, const Progress &progress = {});
+using Backend = std::function<void(const std::string &)>;
+Results search(const Options &o, const Progress &progress = {}, const Backend &backend = {});
 // 可暂停/可取消的重载；旧 Options::checkpoint 仍会在此路径生效。
-Results search(const Options &o, Control &control, const Progress &progress = {});
+Results search(const Options &o, Control &control, const Progress &progress = {}, const Backend &backend = {});
 }

@@ -730,7 +730,7 @@ Center evaluate(const Options &o, int px, int pz) {
     return out;
 }
 
-Results search(const Options &o, const std::function<void(const std::string &, uint64_t, uint64_t)> &progress) {
+Results search(const Options &o, const std::function<void(const std::string &, uint64_t, uint64_t)> &progress, const Backend &backend) {
     auto checkpoint = [&] {
         if (o.checkpoint)
             o.checkpoint();
@@ -834,6 +834,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                     gpu_correct.clear();
                     gpu_legacy.clear();
                 });
+            if (backend) backend(gpu ? "gpu" : "cpu");
             if (!gpu && (o.scan_backend == "gpu" || partial_gpu))
                 throw std::runtime_error(
                     "No compatible OpenCL GPU for this footprint/checkpoint; use a separate CPU checkpoint");
@@ -1313,7 +1314,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
     return out;
 }
 
-Results search(const Options &options, Control &control, const Progress &progress) {
+Results search(const Options &options, Control &control, const Progress &progress, const Backend &backend) {
     Options o = options;
     auto legacy = o.checkpoint;
     o.checkpoint = [&] {
@@ -1326,7 +1327,7 @@ Results search(const Options &options, Control &control, const Progress &progres
     };
     auto start = Clock::now();
     try {
-        return search(o, progress);
+        return search(o, progress, backend);
     } catch (const Cancelled &) {
         // 取消是正常终止：已完成的断点保留，内存结果由宿主丢弃。
         Results out;
