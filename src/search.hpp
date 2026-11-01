@@ -16,6 +16,8 @@ constexpr char kRankingRule[] = "primary-desc-distance-asc-x-asc-z-asc";
 struct Options {
     uint64_t seed = 0;
     std::string seed_text = "0", version = "1.21.1", shape = "circle", scan_backend = "auto";
+    std::string coverage = "game";
+    int inner_radius = 128;
     int center_x = 0, center_z = 0, radius = 10000, tick_radius = 128, simulation_distance = 10;
     int min_geodes = 1, min_budding = 1, prefilter = 0, limit = 100, threads = 8;
     // search_rect = true 时使用精确四至（闭区间），忽略 center/radius/shape。
@@ -36,8 +38,11 @@ struct Options {
     bool contains(int x, int z) const;
     bool intersects_chunk(int cx, int cz) const;
     int activity_radius() const;
+    bool chunk_constant() const { return coverage == "game" && modern; }
+    bool custom() const { return coverage != "game"; }
 };
 
+const std::vector<std::string> &versions();
 void set_version(Options &o, const std::string &version);
 // 全图简写必须先展开，再计算排名距离，
 // 确保实际榜单中心为原点，而不是用户输入但未生效的中心。
@@ -85,6 +90,8 @@ struct Center {
 
 using Weights = std::unordered_map<uint64_t, int>;
 bool active(const Options &o, int player_x, int player_z, int cx, int cz);
+bool active_point(const Options &o, int player_x, int player_z, int x, int z);
+std::pair<int, int> coarse_span(const Options &o, int dz);
 Center optimize(const Options &o, int cx, int cz, const std::vector<Weight> &weights,
                 const std::vector<Weight> &origins = {});
 bool same_hotspot(const Options &o, Center a, Center b);
@@ -102,6 +109,11 @@ bool final_better(int center_x, int center_z, Center a, Center b);
 struct Stats {
     uint64_t scanned = 0, candidates = 0, simulated = 0, weights = 0, pruned = 0, rejected = 0, hotspots = 0,
              optimized = 0, resumed_scan = 0, resumed_simulation = 0;
+    // 两段式裁剪：石模型（无地形）先算母岩数上界，只有上界仍可能进榜的候选才跑地形。
+    // stone_simulated 是上界那一遍的模拟次数，simulated 只统计地形那一遍。
+    uint64_t stone_simulated = 0, two_pass_kept = 0;
+    int two_pass_excluded_bound = 0, two_pass_floor_bound = 0;
+    bool two_pass = false, two_pass_retried = false;
     double scan_ms = 0, simulate_ms = 0, rank_ms = 0, total_ms = 0, resumed_ms = 0;
     std::string scan_backend = "cpu";
 };
@@ -118,9 +130,14 @@ struct Results {
     std::string scan_backend = "cpu";
 };
 
-using Progress = std::function<void(const std::string &, uint64_t, uint64_t)>;
+// 进度回调：阶段名、阶段内完成量、阶段内总量、已扫描区块数。
+// 第四个参数让界面在运行中显示真实扫描量，而不是等结果才知道。
+using ProgressFn = std::function<void(const std::string &, uint64_t, uint64_t, uint64_t)>;
+using Progress = ProgressFn;
+// 后端回调：本次运行实际使用的粗筛后端（如 cpu / gpu）与人类可读说明。
 using Backend = std::function<void(const std::string &, const std::string &)>;
-Results search(const Options &o, const Progress &progress = {}, const Backend &backend = {});
+
+Results search(const Options &o, const ProgressFn &progress = {}, const Backend &backend = {});
 // 可暂停/可取消的重载；旧 Options::checkpoint 仍会在此路径生效。
-Results search(const Options &o, Control &control, const Progress &progress = {}, const Backend &backend = {});
+Results search(const Options &o, Control &control, const ProgressFn &progress = {}, const Backend &backend = {});
 }

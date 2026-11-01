@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstdio>
 #include <exception>
 #include <mutex>
 #include <map>
@@ -207,15 +209,15 @@ class SearchCheckpoint {
         }
         // 生成逻辑、归组或任务归属变化时，必须更新模型/工作划分修订。
         std::ostringstream signature;
-        signature << "geode-native-v1;model=20261025;work=512-4096-64;int=" << sizeof(int) << ";seed=" << o.seed << ';'
+        signature << "geode-native-v2;model=20261027-range;work=512-4096-64-twopass;int=" << sizeof(int) << ";seed=" << o.seed << ';'
                   << o.version << ';' << o.generation << ';' << o.terrain << ';' << o.modern << ';' << o.center_x << ';'
                   << o.center_z << ';' << o.radius << ';' << o.shape << ';' << o.full_world << ';' << o.tick_radius
                   << ';' << o.simulation_distance << ';' << o.min_geodes << ';' << o.min_budding << ';' << o.prefilter
-                  << ';' << o.limit << ';' << o.threads << ';' << o.scan_backend << ';' << kRankingRuleVersion << ';'
-                  << o.search_rect << ';' << o.min_x << ';' << o.max_x << ';' << o.min_z << ';' << o.max_z << ';'
-                  << o.checkpoint_region;
-        journal = std::make_unique<CheckpointJournal>(o.checkpoint_directory, signature.str());
-        journal->replay([&](CheckpointRecord &record) {
+                  << ';' << o.limit << ';' << o.threads << ';' << o.scan_backend << ';' << kRankingRuleVersion
+                  << ';' << o.coverage << ';' << o.inner_radius << ';' << CUBIOMES_REVISION
+                  << ';' << o.search_rect << ';' << o.min_x << ';' << o.max_x << ';' << o.min_z << ';' << o.max_z
+                  << ';' << o.checkpoint_region;
+        journal = std::make_unique<CheckpointJournal>(o.checkpoint_directory, signature.str());        journal->replay([&](CheckpointRecord &record) {
             if (o.checkpoint)
                 o.checkpoint();
             auto kind = record.get<uint8_t>();
@@ -501,6 +503,63 @@ std::vector<Weight> gather(const Weights &all, int cx, int cz, int radius) {
         }
     return result;
 }
+
+// 区块空间的稠密权重网格。游戏覆盖规则的权重键就是区块坐标，搜索范围通常远小于
+// 世界边界，因此可以铺成二维数组，把逐候选的哈希探测换成数组读取；再建一张二维
+// 前缀和，供"活动形状为按区块方形"的版本把窗口求和降到常数次读取。
+// 这只是查找方式的替换，不改变任何数值判定与遍历顺序。
+struct DenseGrid {
+    int min_x = 0, min_z = 0, width = 0, height = 0;
+    std::vector<int> cell;
+    std::vector<int64_t> prefix;
+
+    void build(const Weights &all, int lo_x, int hi_x, int lo_z, int hi_z) {
+        min_x = lo_x;
+        min_z = lo_z;
+        width = hi_x - lo_x + 1;
+        height = hi_z - lo_z + 1;
+        cell.assign(size_t(width) * size_t(height), 0);
+        for (const auto &[k, v] : all) {
+            if (!v)
+                continue;
+            int x = key_x(k), z = key_z(k);
+            if (x < lo_x || x > hi_x || z < lo_z || z > hi_z)
+                continue;
+            cell[size_t(z - lo_z) * size_t(width) + size_t(x - lo_x)] += v;
+        }
+        size_t stride = size_t(width) + 1;
+        prefix.assign(stride * (size_t(height) + 1), 0);
+        for (int z = 0; z < height; ++z) {
+            int64_t row = 0;
+            for (int x = 0; x < width; ++x) {
+                row += cell[size_t(z) * size_t(width) + size_t(x)];
+                prefix[size_t(z + 1) * stride + size_t(x + 1)] =
+                    prefix[size_t(z) * stride + size_t(x + 1)] + row;
+            }
+        }
+    }
+
+    bool covers(int x, int z) const {
+        return x >= min_x && x < min_x + width && z >= min_z && z < min_z + height;
+    }
+
+    int at(int x, int z) const {
+        if (!covers(x, z))
+            return 0;
+        return cell[size_t(z - min_z) * size_t(width) + size_t(x - min_x)];
+    }
+
+    // 半开区间矩形和；区间先夹到网格边界，越界部分按 0 计。
+    int64_t rect(int x0, int z0, int x1, int z1) const {
+        int cx0 = std::clamp(x0 - min_x, 0, width), cx1 = std::clamp(x1 - min_x, 0, width);
+        int cz0 = std::clamp(z0 - min_z, 0, height), cz1 = std::clamp(z1 - min_z, 0, height);
+        if (cx0 >= cx1 || cz0 >= cz1)
+            return 0;
+        size_t stride = size_t(width) + 1;
+        return prefix[size_t(cz1) * stride + size_t(cx1)] - prefix[size_t(cz0) * stride + size_t(cx1)] -
+               prefix[size_t(cz1) * stride + size_t(cx0)] + prefix[size_t(cz0) * stride + size_t(cx0)];
+    }
+};
 }
 
 void Control::checkpoint() {
@@ -576,7 +635,9 @@ bool Options::intersects_chunk(int x, int z) const {
 }
 
 int Options::activity_radius() const {
-    return modern ? simulation_distance : (tick_radius + 15) / 16;
+    if (custom())
+        return (inner_radius + 15) / 16 + 1;
+    return modern ? std::min(simulation_distance, 31) : (tick_radius + 15) / 16;
 }
 
 void expand_full_world(Options &o) {
@@ -585,6 +646,44 @@ void expand_full_world(Options &o) {
     o.radius = 30000000;
     o.shape = "square";
     o.full_world = true;
+}
+
+const std::vector<std::string> &versions() {
+    static const std::vector<std::string> values = {
+        "1.18",
+        "1.18.1",
+        "1.18.2",
+        "1.19",
+        "1.19.1",
+        "1.19.2",
+        "1.19.3",
+        "1.19.4",
+        "1.20",
+        "1.20.1",
+        "1.20.2",
+        "1.20.3",
+        "1.20.4",
+        "1.20.5",
+        "1.20.6",
+        "1.21",
+        "1.21.1",
+        "1.21.2",
+        "1.21.3",
+        "1.21.4",
+        "1.21.5",
+        "1.21.6",
+        "1.21.7",
+        "1.21.8",
+        "1.21.9",
+        "1.21.10",
+        "1.21.11",
+        "26.1",
+        "26.1.1",
+        "26.1.2",
+        "26.2",
+        "26.3",
+    };
+    return values;
 }
 
 void set_version(Options &o, const std::string &text) {
@@ -612,14 +711,43 @@ void set_version(Options &o, const std::string &text) {
 }
 
 bool active(const Options &o, int px, int pz, int cx, int cz) {
-    if (o.modern)
-        return std::abs(floor_div(px, 16) - cx) <= o.simulation_distance &&
-               std::abs(floor_div(pz, 16) - cz) <= o.simulation_distance;
+    if (o.chunk_constant())
+        return std::abs(floor_div(px, 16) - cx) <= o.activity_radius() &&
+               std::abs(floor_div(pz, 16) - cz) <= o.activity_radius();
+    if (o.custom())
+        return active_point(o, px, pz, cx * 16 + 8, cz * 16 + 8);
     int64_t dx = int64_t(cx) * 16 + 8 - px, dz = int64_t(cz) * 16 + 8 - pz;
     return dx * dx + dz * dz < int64_t(o.tick_radius) * o.tick_radius;
 }
 
+bool active_point(const Options &o, int px, int pz, int x, int z) {
+    if (!o.custom())
+        return active(o, px, pz, floor_div(x, 16), floor_div(z, 16));
+    int64_t dx = int64_t(x) - px, dz = int64_t(z) - pz;
+    if (o.coverage == "square")
+        return std::abs(dx) <= o.inner_radius && std::abs(dz) <= o.inner_radius;
+    return dx * dx + dz * dz <= int64_t(o.inner_radius) * o.inner_radius;
+}
+
+std::pair<int, int> coarse_span(const Options &o, int dz) {
+    if (o.chunk_constant()) {
+        int q = o.activity_radius();
+        return std::abs(dz) <= q ? std::pair{-q, q} : std::pair{0, -1};
+    }
+    int distance = dz > 0 ? dz * 16 - 7 : dz < 0 ? -dz * 16 - 8 : 0;
+    int radius = o.custom() ? o.inner_radius : o.tick_radius;
+    int64_t remaining = int64_t(radius) * radius - (o.custom() ? 0 : 1) - int64_t(distance) * distance;
+    if (o.coverage == "square")
+        remaining = distance <= radius ? int64_t(radius) * radius : -1;
+    if (remaining < 0)
+        return {0, -1};
+    int reach = isqrt(remaining);
+    return {-((reach + 8) / 16), (reach + 7) / 16};
+}
+
 bool same_hotspot(const Options &o, Center a, Center b) {
+    if (o.custom())
+        return active_point(o, a.x, a.z, b.x, b.z);
     return active(o, a.x, a.z, floor_div(b.x, 16), floor_div(b.z, 16)) &&
            active(o, b.x, b.z, floor_div(a.x, 16), floor_div(a.z, 16));
 }
@@ -659,7 +787,7 @@ Center optimize(const Options &o, int cx, int cz, const std::vector<Weight> &wei
                 const std::vector<Weight> &origins) {
     Center best;
     int bx = cx * 16, bz = cz * 16;
-    if (o.modern) {
+    if (o.chunk_constant()) {
         int sum = 0, geodes = 0;
         for (auto w : weights)
             if (active(o, bx, bz, w.x, w.z))
@@ -677,11 +805,15 @@ Center optimize(const Options &o, int cx, int cz, const std::vector<Weight> &wei
         return best;
     }
     int diff[16][17]{}, geode_diff[16][17]{};
-    auto accumulate = [&](const std::vector<Weight> &source, int (&layer)[16][17]) {
+    auto accumulate = [&](const std::vector<Weight> &source, int (&layer)[16][17], bool blocks) {
         for (auto w : source) {
-            int tx = w.x * 16 + 8, tz = w.z * 16 + 8;
+            int tx = blocks ? w.x : w.x * 16 + 8, tz = blocks ? w.z : w.z * 16 + 8;
             for (int z = 0; z < 16; ++z) {
-                int64_t dz = int64_t(tz) - bz - z, remaining = int64_t(o.tick_radius) * o.tick_radius - 1 - dz * dz;
+                int radius = o.custom() ? o.inner_radius : o.tick_radius;
+                int64_t dz = int64_t(tz) - bz - z;
+                int64_t remaining = int64_t(radius) * radius - (o.custom() ? 0 : 1) - dz * dz;
+                if (o.coverage == "square")
+                    remaining = std::abs(dz) <= radius ? int64_t(radius) * radius : -1;
                 if (remaining < 0)
                     continue;
                 int reach = isqrt(remaining), lo = std::max(0, tx - reach - bx), hi = std::min(15, tx + reach - bx);
@@ -692,8 +824,8 @@ Center optimize(const Options &o, int cx, int cz, const std::vector<Weight> &wei
             }
         }
     };
-    accumulate(weights, diff);
-    accumulate(origins, geode_diff);
+    accumulate(weights, diff, o.custom());
+    accumulate(origins, geode_diff, false);
     for (int z = 0; z < 16; ++z) {
         int sum = 0, geodes = 0;
         for (int x = 0; x < 16; ++x) {
@@ -724,15 +856,15 @@ Center evaluate(const Options &o, int px, int pz) {
                     ++out.geodes;
                 for (auto b : s.budding)
                     if (in_world(floor_div(b.x, 16), floor_div(b.z, 16)) &&
-                        active(o, px, pz, floor_div(b.x, 16), floor_div(b.z, 16)))
+                        active_point(o, px, pz, b.x, b.z))
                         ++out.budding;
             }
     return out;
 }
 
-Results search(const Options &o, const std::function<void(const std::string &, uint64_t, uint64_t)> &progress, const Backend &backend) {
-    auto checkpoint = [&] {
-        if (o.checkpoint)
+static Results search_impl(const Options &o, const ProgressFn &progress, const Backend &backend, bool allow_two_pass,
+                           bool &insufficient) {
+    auto checkpoint = [&] {        if (o.checkpoint)
             o.checkpoint();
     };
     if (o.search_rect && (o.min_x > o.max_x || o.min_z > o.max_z || o.min_x < -30000000 ||
@@ -784,7 +916,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
         candidates = std::move(saved.candidates);
         if (progress) {
             uint64_t units = o.prefilter ? saved.stats.resumed_scan : uint64_t(scanned);
-            progress("scan", units, units);
+            progress("scan", units, units, uint64_t(scanned));
         }
     } else if (!o.prefilter) {
         for (int z = minz; z <= maxz; ++z) {
@@ -795,7 +927,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
         }
         scanned = uint64_t(maxx - minx + 1) * (maxz - minz + 1);
         if (progress)
-            progress("scan", scanned, scanned);
+            progress("scan", scanned, scanned, uint64_t(scanned));
     } else {
         bool gpu = false;
         std::string gpu_failure;
@@ -825,7 +957,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                 },
                 [&](uint64_t completed, uint64_t total) {
                     if (progress)
-                        progress("scan", completed, total);
+                        progress("scan", completed, total, uint64_t(scanned));
                 },
                 [&](uint64_t id) {
                     return saved.scan_done(size_t(id));
@@ -854,18 +986,9 @@ Results search(const Options &o, const std::function<void(const std::string &, u
 
             std::vector<Span> footprint;
             for (int dz = -r; dz <= r; ++dz) {
-                if (o.modern) {
-                    if (std::abs(dz) <= o.simulation_distance)
-                        footprint.push_back({dz, -o.simulation_distance, o.simulation_distance});
-                } else {
-                    // 取该区块内任意整数玩家位置可激活的来源中心并集。
-                    int distance = dz > 0 ? dz * 16 - 7 : dz < 0 ? -dz * 16 - 8 : 0;
-                    int64_t remaining = int64_t(o.tick_radius) * o.tick_radius - 1 - int64_t(distance) * distance;
-                    if (remaining >= 0) {
-                        int reach = isqrt(remaining);
-                        footprint.push_back({dz, -((reach + 8) / 16), (reach + 7) / 16});
-                    }
-                }
+                auto [lo, hi] = coarse_span(o, dz);
+                if (lo <= hi)
+                    footprint.push_back({dz, lo, hi});
             }
             parallel(size_t(tiles_x) * tiles_z, scan_threads, [&](size_t tile, int id) {
                 checkpoint();
@@ -885,7 +1008,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                     uint64_t completed = ++done;
                     if (progress) {
                         std::lock_guard lock(report);
-                        progress("scan", completed, uint64_t(tiles_x) * tiles_z);
+                        progress("scan", completed, uint64_t(tiles_x) * tiles_z, uint64_t(scanned));
                     }
                 };
                 if (!o.contains(std::clamp(o.center_x, ax * 16, bx * 16 + 15),
@@ -894,10 +1017,10 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                     return;
                 }
                 int width = bx - ax + 1 + 2 * r, height = bz - az + 1 + 2 * r, stride = width + 1;
-                if (o.modern) {
+                if (o.chunk_constant()) {
                     // 方形滑窗只维护进入/离开行与各列总数。
                     // 保留双阈值；历史Java候选池相差一个24位随机数取值。
-                    int q = o.simulation_distance, diameter = 2 * q + 1;
+                    int q = o.activity_radius(), diameter = 2 * q + 1;
                     std::vector<uint8_t> history(size_t(width) * diameter);
                     std::vector<int> columns(width), old_columns(width);
                     std::vector<uint32_t> placements(width);
@@ -949,8 +1072,8 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                         b += bits < 699050;
                         size_t p = size_t(z + 1) * stride + x + 1;
                         area[p] = area[p - stride] + a;
-                        prefix[p] = o.modern ? area[p] : a;
-                        old[p] = o.modern ? old[p - stride] + b : b;
+                        prefix[p] = o.chunk_constant() ? area[p] : a;
+                        old[p] = o.chunk_constant() ? old[p - stride] + b : b;
                     }
                 }
                 auto rectangle = [&](const std::vector<int> &p, int x0, int z0, int x1, int z1) {
@@ -960,7 +1083,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                 int q = o.activity_radius();
                 auto sum = [&](const std::vector<int> &p, int x, int z) {
                     int cx = x - ax + r, cz = z - az + r;
-                    if (o.modern)
+                    if (o.chunk_constant())
                         return rectangle(p, cx - q, cz - q, cx + q + 1, cz + q + 1);
                     int count = 0;
                     for (auto span : footprint) {
@@ -1043,6 +1166,199 @@ Results search(const Options &o, const std::function<void(const std::string &, u
     out.stats.candidates = candidates.size();
     out.stats.scan_ms = saved.scan_complete ? saved.stats.scan_ms : saved.scan_ms();
     saved.scan_finish(candidates, out.stats);
+    // 模拟阶段的空间分块：分块越大，线程内地形/雕刻器缓存复用越好；
+    // 但分块过大会让并行粒度不足。实测最优分块随搜索范围缩放，
+    // 取"区域边长约 1/10"，并夹在 [128, 256]。
+    const int simulation_tile = std::clamp((maxx - minx + 1) / 10, 128, 256);
+    // ── 两段式精确裁剪 ──
+    // 地形模拟只会删除母岩：控制点失效会取消整座晶洞，覆盖判定只会过滤已生成的母岩，
+    // 不会新增。因此"纯几何模型（无地形）"算出的母岩数是任意挂机点上的严格上界。
+    // 先用它给每个候选窗口定上界，只让上界仍可能进入最终榜单的候选参与昂贵的地形模拟。
+    // 由于上界严格成立，这一步不改变最终榜单，只是少算了注定进不了榜的区域。
+    std::vector<Candidate> excluded;
+    int excluded_max_bound = 0;
+    int two_pass_floor_bound = 0;
+    uint64_t two_pass_kept_count = 0;
+    bool two_pass = false;
+    if (allow_two_pass && o.terrain && o.prefilter > 0 && candidates.size() > 4000) {
+        struct StoneSpan {
+            int z, lo, hi;
+        };
+        std::map<int, std::vector<std::pair<int, int>>> rows;
+        for (auto c : candidates)
+            for (int z = c.z - r; z <= c.z + r; ++z)
+                if (z >= world_min_chunk && z <= world_max_chunk)
+                    rows[z].push_back({std::max(world_min_chunk, c.x - r), std::min(world_max_chunk, c.x + r)});
+        std::map<uint64_t, std::vector<StoneSpan>> tiles;
+        for (auto &[z, line] : rows) {
+            std::sort(line.begin(), line.end());
+            std::vector<std::pair<int, int>> merged_rows;
+            for (auto p : line) {
+                if (merged_rows.empty() || p.first > merged_rows.back().second + 1)
+                    merged_rows.push_back(p);
+                else
+                    merged_rows.back().second = std::max(merged_rows.back().second, p.second);
+            }
+            for (auto [lo, hi] : merged_rows)
+                for (int x = lo; x <= hi;) {
+                    int tx = floor_div(x, simulation_tile), end = std::min(hi, (tx + 1) * simulation_tile - 1);
+                    tiles[key(tx, floor_div(z, simulation_tile))].push_back({z, x, end});
+                    x = end + 1;
+                }
+        }
+        rows.clear();
+        std::vector<std::vector<StoneSpan>> stone_work;
+        std::vector<uint64_t> stone_keys;
+        stone_work.reserve(tiles.size());
+        for (auto &[k, list] : tiles) {
+            stone_keys.push_back(k);
+            stone_work.push_back(std::move(list));
+        }
+        tiles.clear();
+        // 上界那一遍：关闭地形，只算纯几何母岩数。权重键与正式精排保持一致，
+        // 自定义覆盖按母岩实际 XZ 计分，其余按区块计。
+        // 这一遍在后段任务里可能比地形那一遍还久，必须单独上报进度：
+        // 否则界面会一直停在粗筛的最后那一帧，看起来像卡死。
+        std::vector<Weights> stone_local(nthreads);
+        std::vector<uint64_t> stone_counts(nthreads, 0);
+        uint64_t stone_total = stone_work.size();
+        std::atomic<uint64_t> stone_done{0};
+        auto stone_reported = Clock::now();
+        parallel(stone_total, nthreads, [&](size_t i, int id) {
+            checkpoint();
+            auto &simulator = scan_engines[id];
+            auto &weights = stone_local[id];
+            for (auto row : stone_work[i])
+                for (int x = row.lo; x <= row.hi; ++x) {
+                    if ((x - row.lo) % 32 == 0)
+                        checkpoint();
+                    if (!simulator.check(x, row.z))
+                        continue;
+                    ++stone_counts[size_t(id)];
+                    auto s = simulator.generate(x, row.z, nullptr);
+                    for (auto p : s.budding) {
+                        int cx = floor_div(p.x, 16), cz = floor_div(p.z, 16);
+                        if (in_world(cx, cz))
+                            ++weights[o.custom() ? key(p.x, p.z) : key(cx, cz)];
+                    }
+                }
+            uint64_t completed = ++stone_done;
+            if (progress) {
+                std::lock_guard lock(report);
+                auto now = Clock::now();
+                if (completed == stone_total || now - stone_reported >= std::chrono::milliseconds(60)) {
+                    stone_reported = now;
+                    progress("stone", completed, stone_total, uint64_t(scanned));
+                }
+            }
+        });
+        stone_work.clear();
+        // 统一折算到区块粒度：上界只需要"每个区块最多能贡献多少母岩"，
+        // 上界只需要"每个位置最多能贡献多少母岩"，与活动形状无关：
+        // 非自定义按区块汇总，自定义按实际母岩 XZ 建区块索引后逐点判定。
+        Weights chunk_totals;
+        std::unordered_map<uint64_t, std::vector<Weight>> stone_buckets;
+        for (auto i = 0; i < nthreads; ++i)
+            out.stats.stone_simulated += stone_counts[size_t(i)];
+        for (auto &m : stone_local) {
+            for (auto [k, v] : m) {
+                if (o.custom()) {
+                    int x = key_x(k), z = key_z(k);
+                    stone_buckets[key(floor_div(x, 16), floor_div(z, 16))].push_back({x, z, v});
+                } else {
+                    chunk_totals[k] += v;
+                }
+            }
+            m.clear();
+        }
+        // 每个候选的活动窗口上界。coarse_span() 给出的行跨度已经把
+        // "玩家在候选区块内任意位置"的偏移算进去了，因此按它求和覆盖了
+        // 候选区块内所有挂机点，是对组内上界的严格上界。方形、欧式圆盘、
+        // 旧版区块中心圆和新版按区块方形都由该函数统一给出。
+        int q = o.activity_radius() + 1;
+        std::vector<std::pair<int, size_t>> ranked_bounds(candidates.size());
+        parallel(candidates.size(), nthreads, [&](size_t i, int) {
+            checkpoint();
+            auto c = candidates[i];
+            int64_t sum = 0;
+            if (o.chunk_constant()) {
+                // 区块常量规则：候选区块内任意位置的活动区块集合相同，
+                // 直接用按区块汇总的方形窗口和，等价于组内上界。
+                for (int dz = -q; dz <= q; ++dz) {
+                    auto span = coarse_span(o, dz);
+                    if (span.first > span.second)
+                        continue;
+                    for (int dx = span.first; dx <= span.second; ++dx) {
+                        auto it = chunk_totals.find(key(c.x + dx, c.z + dz));
+                        if (it != chunk_totals.end())
+                            sum += it->second;
+                    }
+                }
+            } else {
+                // 旧版圆形与自定义范围：直接复用正式精排的组内上界算法
+                // （把权重点夹到候选区块内再判断活动形状），只是权重换成石模型。
+                // 这样上界与真实评分同形同尺度，没有"外扩"带来的虚高。
+                int wradius = o.activity_radius() + 1;
+                for (int wz = c.z - wradius; wz <= c.z + wradius; ++wz)
+                    for (int wx = c.x - wradius; wx <= c.x + wradius; ++wx) {
+                        auto ck = key(wx, wz);
+                        if (!o.custom()) {
+                            auto found = chunk_totals.find(ck);
+                            if (found == chunk_totals.end())
+                                continue;
+                            int bx = wx * 16 + 8, bz = wz * 16 + 8;
+                            int px = std::clamp(bx, c.x * 16, c.x * 16 + 15);
+                            int pz = std::clamp(bz, c.z * 16, c.z * 16 + 15);
+                            if (active_point(o, px, pz, bx, bz))
+                                sum += found->second;
+                        } else {
+                            auto bucket = stone_buckets.find(ck);
+                            if (bucket == stone_buckets.end())
+                                continue;
+                            for (auto w : bucket->second) {
+                                int px = std::clamp(w.x, c.x * 16, c.x * 16 + 15);
+                                int pz = std::clamp(w.z, c.z * 16, c.z * 16 + 15);
+                                if (active_point(o, px, pz, w.x, w.z))
+                                    sum += w.budding;
+                            }
+                        }
+                    }
+            }
+            ranked_bounds[i] = {int(std::min<int64_t>(sum, INT32_MAX)), i};
+            if ((i % 4096) == 0)
+                checkpoint();
+        });
+        chunk_totals.clear();
+        std::sort(ranked_bounds.begin(), ranked_bounds.end(),
+                  [](const auto &a, const auto &b) { return a.first > b.first; });
+        // 保留规则按"上界阈值"而不是固定条数：高分候选往往挤在少数热点里，
+        // 只按条数截断会漏掉其他区域本可进榜的热点。这里以第 limit 高的上界为基准
+        // 再留 25% 余量，随着搜索范围自动伸缩，同时保证空间上覆盖足够多的热点。
+        int cutIndex = int(std::min<size_t>(size_t(std::max(0, o.limit - 1)), ranked_bounds.size() - 1));
+        int topBound = ranked_bounds[cutIndex].first;
+        bool circleShape = !o.chunk_constant() && o.coverage != "square";
+        // 圆形与自定义范围的石模型上界比地形实分高约 15%（地形删掉的母岩），
+        // 方形规则只有约 10%，因此圆形留更多余量；不足仍由自检回退兜底。
+        int floorBound = std::max(o.min_budding, circleShape ? topBound * 13 / 20 : topBound * 3 / 4);
+        two_pass_floor_bound = floorBound;
+        size_t keep = 0;
+        while (keep < ranked_bounds.size() && ranked_bounds[keep].first >= floorBound)
+            ++keep;
+        keep = std::max<size_t>(keep, 4000);
+        keep = std::min(keep, candidates.size());
+        std::vector<Candidate> kept;
+        kept.reserve(keep);
+        for (size_t i = 0; i < keep; ++i)
+            kept.push_back(candidates[ranked_bounds[i].second]);
+        for (size_t i = keep; i < ranked_bounds.size(); ++i)
+            excluded.push_back(candidates[ranked_bounds[i].second]);
+        excluded_max_bound = excluded.empty() ? 0 : ranked_bounds[keep].first;
+        std::sort(kept.begin(), kept.end(), [](auto a, auto b) { return std::pair(a.x, a.z) < std::pair(b.x, b.z); });
+        candidates.swap(kept);
+        two_pass_kept_count = candidates.size();
+        two_pass = true;
+    }
+
     out.approximate = o.prefilter != 0;
     out.scan_backend = out.stats.scan_backend;
 #ifdef GEODE_SCAN_PROBE
@@ -1112,8 +1428,6 @@ Results search(const Options &o, const std::function<void(const std::string &, u
     };
 
     std::map<uint64_t, std::vector<Span>> tile_rows;
-    // 64区块瓦片加雕刻器八区块边缘共80×80，可放入8192来源缓存。
-    constexpr int simulation_tile = 64;
     for (const auto &row : intervals)
         for (auto [lo, hi] : row.intervals)
             for (int x = lo; x <= hi;) {
@@ -1129,8 +1443,9 @@ Results search(const Options &o, const std::function<void(const std::string &, u
         work.push_back(std::move(rows));
     }
     tile_rows.clear();
+    auto simulate_reported = Clock::now();
     if (progress && saved.stats.resumed_simulation)
-        progress("simulate", done, work.size());
+        progress("simulate", done, work.size(), uint64_t(scanned));
     parallel(work.size(), nthreads, [&](size_t i, int id) {
         checkpoint();
         if (saved.simulation_done(work_keys[i]))
@@ -1155,7 +1470,7 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                 for (auto p : s.budding) {
                     int cx = floor_div(p.x, 16), cz = floor_div(p.z, 16);
                     if (in_world(cx, cz))
-                        ++weights[key(cx, cz)];
+                        ++weights[o.custom() ? key(p.x, p.z) : key(cx, cz)];
                 }
             }
         if (saved.enabled())
@@ -1165,9 +1480,15 @@ Results search(const Options &o, const std::function<void(const std::string &, u
             local_rejected[id] += rejected;
         }
         uint64_t completed = ++done;
-        if (progress && completed % 32 == 0) {
+        // 按时间而不是固定条数节流：固定 32 条会让最后不足 32 个分区永远不上报，
+        // 进度条卡在 99.x% 不动。
+        if (progress) {
             std::lock_guard lock(report);
-            progress("simulate", completed, work.size());
+            auto now = Clock::now();
+            if (completed == work.size() || now - simulate_reported >= std::chrono::milliseconds(60)) {
+                simulate_reported = now;
+                progress("simulate", completed, work.size(), uint64_t(scanned));
+            }
         }
     });
     Weights weights = std::move(saved.weights), origins = std::move(saved.origins);
@@ -1183,12 +1504,72 @@ Results search(const Options &o, const std::function<void(const std::string &, u
         for (auto k : local_origins[id])
             origins.emplace(k, 1);
     }
+    // 自定义范围按母岩实际XZ统计；按区块建立索引，避免每个候选遍历全部母岩。
+    std::unordered_map<uint64_t, std::vector<Weight>> point_buckets;
+    if (o.custom())
+        for (auto [k, count] : weights) {
+            int x = int(int32_t(k >> 32)), z = int(int32_t(k));
+            point_buckets[key(floor_div(x, 16), floor_div(z, 16))].push_back({x, z, count});
+        }
+    // 稠密网格只在权重键为区块坐标且包围盒有限时启用；大范围或自定义范围
+    // 继续走原哈希路径，行为与内存占用都不变。
+    DenseGrid weight_grid, origin_grid;
+    bool dense = false;
+    if (!o.custom()) {
+        int pad = o.activity_radius() + 2;
+        int lo_x = std::max(world_min_chunk, minx - pad), hi_x = std::min(world_max_chunk, maxx + pad);
+        int lo_z = std::max(world_min_chunk, minz - pad), hi_z = std::min(world_max_chunk, maxz + pad);
+        int64_t cells = int64_t(hi_x - lo_x + 1) * int64_t(hi_z - lo_z + 1);
+        if (cells > 0 && cells <= 40000000) {
+            weight_grid.build(weights, lo_x, hi_x, lo_z, hi_z);
+            origin_grid.build(origins, lo_x, hi_x, lo_z, hi_z);
+            dense = true;
+        }
+    }
+    auto gather_weights = [&](int cx, int cz, int radius) {
+        if (!o.custom() && dense) {
+            // 与 gather() 相同的遍历顺序与"跳过零值"规则，只把哈希探测换成数组读取。
+            std::vector<Weight> result;
+            result.reserve(256);
+            for (int z = cz - radius; z <= cz + radius; ++z)
+                for (int x = cx - radius; x <= cx + radius; ++x) {
+                    int v = weight_grid.at(x, z);
+                    if (v)
+                        result.push_back({x, z, v});
+                }
+            return result;
+        }
+        if (!o.custom())
+            return gather(weights, cx, cz, radius);
+        std::vector<Weight> result;
+        for (int z = cz - radius; z <= cz + radius; ++z)
+            for (int x = cx - radius; x <= cx + radius; ++x) {
+                auto it = point_buckets.find(key(x, z));
+                if (it != point_buckets.end())
+                    result.insert(result.end(), it->second.begin(), it->second.end());
+            }
+        return result;
+    };
+    auto gather_origins = [&](int cx, int cz, int radius) {
+        if (!o.custom() && dense) {
+            std::vector<Weight> result;
+            result.reserve(64);
+            for (int z = cz - radius; z <= cz + radius; ++z)
+                for (int x = cx - radius; x <= cx + radius; ++x) {
+                    int v = origin_grid.at(x, z);
+                    if (v)
+                        result.push_back({x, z, v});
+                }
+            return result;
+        }
+        return gather(origins, cx, cz, radius);
+    };
     out.stats.weights = weights.size();
     out.stats.simulate_ms = saved.simulation_ms(simulation_start, simulation_paused);
     auto rank_start = Clock::now();
     double rank_paused = saved.pause_ms();
     if (progress)
-        progress("rank", 0, out.stats.candidates);
+        progress("rank", 0, out.stats.candidates, uint64_t(scanned));
 
     struct Prepared {
         Candidate chunk;
@@ -1196,11 +1577,12 @@ Results search(const Options &o, const std::function<void(const std::string &, u
         int bound;
     };
 
+    std::atomic<uint64_t> rank_done{0};
+    auto rank_reported = Clock::now();
     std::vector<Prepared> prepared(candidates.size());
     parallel(candidates.size(), nthreads, [&](size_t i, int) {
         checkpoint();
         auto c = candidates[i];
-        auto nearby = gather(weights, c.x, c.z, o.activity_radius() + 1);
         int x = c.x * 16 + 8, z = c.z * 16 + 8;
         if (!o.contains(x, z)) {
             x = std::clamp(o.center_x, c.x * 16, c.x * 16 + 15);
@@ -1208,18 +1590,40 @@ Results search(const Options &o, const std::function<void(const std::string &, u
         }
         int bound = 0;
         Center score{x, z, 0, 0};
-        for (auto w : nearby) {
-            int px = std::clamp(w.x * 16 + 8, c.x * 16, c.x * 16 + 15),
-                pz = std::clamp(w.z * 16 + 8, c.z * 16, c.z * 16 + 15);
-            if (active(o, px, pz, w.x, w.z))
-                bound += w.budding;
-            if (active(o, x, z, w.x, w.z))
-                score.budding += w.budding;
+        if (dense && o.chunk_constant()) {
+            // 区块常量规则下，候选区块内任意整数位置对应的活动区块集合都等于
+            // 以该区块为中心的方形邻域（夹取到区块内不会改变所属区块），
+            // 因此"组内上界"与"中心评分"是同一个窗口和，可用前缀和一次求出。
+            int q = o.activity_radius();
+            int64_t sum = weight_grid.rect(c.x - q, c.z - q, c.x + q + 1, c.z + q + 1);
+            bound = int(sum);
+            score.budding = int(sum);
+            score.geodes = int(origin_grid.rect(c.x - q, c.z - q, c.x + q + 1, c.z + q + 1));
+        } else {
+            auto nearby = gather_weights(c.x, c.z, o.activity_radius() + 1);
+            for (auto w : nearby) {
+                int wx = o.custom() ? w.x : w.x * 16 + 8, wz = o.custom() ? w.z : w.z * 16 + 8;
+                int px = std::clamp(wx, c.x * 16, c.x * 16 + 15),
+                    pz = std::clamp(wz, c.z * 16, c.z * 16 + 15);
+                if (active_point(o, px, pz, wx, wz))
+                    bound += w.budding;
+                if (active_point(o, x, z, wx, wz))
+                    score.budding += w.budding;
+            }
+            for (auto w : gather_origins(c.x, c.z, o.activity_radius()))
+                if (active(o, x, z, w.x, w.z))
+                    score.geodes += w.budding;
         }
-        for (auto w : gather(origins, c.x, c.z, o.activity_radius()))
-            if (active(o, x, z, w.x, w.z))
-                score.geodes += w.budding;
         prepared[i] = {c, score, bound};
+        uint64_t done_count = ++rank_done;
+        if (progress) {
+            std::lock_guard lock(report);
+            auto now = Clock::now();
+            if (done_count == prepared.size() || now - rank_reported >= std::chrono::milliseconds(60)) {
+                rank_reported = now;
+                progress("rank", done_count, prepared.size(), uint64_t(scanned));
+            }
+        }
     });
     std::sort(prepared.begin(), prepared.end(), [](const auto &a, const auto &b) {
         return center_better(a.center, b.center);
@@ -1275,10 +1679,10 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                 pruned += members.size() - j;
                 break;
             }
-            auto source = gather(origins, p.chunk.x, p.chunk.z, o.activity_radius());
+            auto source = gather_origins(p.chunk.x, p.chunk.z, o.activity_radius());
             if (source.empty())
                 continue;
-            auto c = optimize(o, p.chunk.x, p.chunk.z, gather(weights, p.chunk.x, p.chunk.z, o.activity_radius() + 1),
+            auto c = optimize(o, p.chunk.x, p.chunk.z, gather_weights(p.chunk.x, p.chunk.z, o.activity_radius() + 1),
                               source);
             ++optimized;
             if (center_better(c, best))
@@ -1308,6 +1712,18 @@ Results search(const Options &o, const std::function<void(const std::string &, u
                 break;
         }
     }
+    // 裁剪自检：被排除候选的上界必须严格低于最终榜单的最低分，否则说明保留的
+    // 候选不够，可能漏掉本应进榜的热点。这里只判定并记录，不静默改动输出。
+    if (two_pass) {
+        int threshold = out.centers.empty() ? 0 : out.centers.back().budding;
+        insufficient = !out.centers.empty() && excluded_max_bound >= threshold;
+        std::fprintf(stderr, "TWOPASS keptBound=%d excluded=%zu excludedMaxBound=%d threshold=%d sufficient=%d\n",
+                     two_pass_floor_bound, excluded.size(), excluded_max_bound, threshold, int(!insufficient));
+    }
+    out.stats.two_pass = two_pass;
+    out.stats.two_pass_kept = two_pass_kept_count;
+    out.stats.two_pass_excluded_bound = excluded_max_bound;
+    out.stats.two_pass_floor_bound = two_pass_floor_bound;
     out.stats.hotspots = hotspots.size();
     out.stats.optimized = optimized;
     out.stats.pruned = pruned;
@@ -1315,8 +1731,21 @@ Results search(const Options &o, const std::function<void(const std::string &, u
     out.stats.total_ms = saved.total_ms();
     return out;
 }
+Results search(const Options &o, const ProgressFn &progress, const Backend &backend) {
+    bool insufficient = false;
+    Results first = search_impl(o, progress, backend, true, insufficient);
+    // 两段式裁剪依赖"石模型母岩数是严格上界"。自检若发现保留的候选不足，
+    // 就按未裁剪的完整地形模拟重跑一次，保证不会因为裁剪漏掉热点。
+    if (insufficient) {
+        std::fprintf(stderr, "TWOPASS insufficient, retrying without pruning\n");
+        Results retried = search_impl(o, progress, backend, false, insufficient);
+        retried.stats.two_pass_retried = true;
+        return retried;
+    }
+    return first;
+}
 
-Results search(const Options &options, Control &control, const Progress &progress, const Backend &backend) {
+Results search(const Options &options, Control &control, const ProgressFn &progress, const Backend &backend) {
     Options o = options;
     auto legacy = o.checkpoint;
     o.checkpoint = [&] {
@@ -1340,4 +1769,4 @@ Results search(const Options &options, Control &control, const Progress &progres
         return out;
     }
 }
-}
+}
