@@ -73,9 +73,22 @@ double Random::next_double() {
 }
 
 namespace {
+// NormalNoise 的单层幅度系数，按版本精度区分：
+//   1.21.11 / 26.1.2 / 26.2（double 路径，NormalNoise.getValue）：
+//     valueFactor = 0.16666666666666666 / expectedDeviation(0)
+//                 = 0.16666666666666666 / 0.2 = 0x1.aaaaaaaaaaaaap-1
+//     它**不等于** 5.0/6.0（后者为 0x1.aaaaaaaaaaaabp-1，差 1 ulp）。
+//     在 double 上该 ulp 会真实传播：随机抽样下约 2/3 的噪声乘积不同。
+//   26.3（float 路径，NormalNoise.createParity + NoiseStack.get）：
+//     normalizationFactor 重算后降为 float，结果与 float(5.0/6.0) 完全一致，
+//     因此两条路径必须分别取系数。
+constexpr double kNoiseFactorDouble = 0.16666666666666666 / 0.2;  // 0.8333333333333333
+constexpr float kNoiseFactorFloat = float(5.0 / 6.0);              // 0.8333333134651184
+}
+
+namespace {
 struct Legacy {
     uint64_t state;
-
     explicit Legacy(uint64_t seed) : state((seed ^ 0x5DEECE66DULL) & ((1ULL << 48) - 1)) {}
 
     uint32_t bits(int n) {
@@ -228,7 +241,7 @@ struct Field {
             return cubiomes::java263::perlin(n.permutation.data(), n.dx, n.dy, n.dz, x * scale / 16.0, y * scale / 16.0,
                                     z * scale / 16.0);
         };
-        float a = float(5.0 / 6.0) * sample(first, 1), b = float(5.0 / 6.0) * sample(second, 1.0181268882175227);
+        float a = kNoiseFactorFloat * sample(first, 1), b = kNoiseFactorFloat * sample(second, 1.0181268882175227);
         return double(a + b) * 0.05;
     }
 
@@ -406,7 +419,7 @@ Material Simulator::material(const GeodeShape &s, Block point) const {
     double noise =
         impl_->float_noise
             ? impl_->field.sample263(point.x, point.y, point.z)
-            : (sample(impl_->field.first, 1) + sample(impl_->field.second, 1.0181268882175227)) * (5.0 / 6.0) * 0.05;
+            : (sample(impl_->field.first, 1) + sample(impl_->field.second, 1.0181268882175227)) * kNoiseFactorDouble * 0.05;
     auto &inv = inverse_sqrt(impl_->legacy_shape, impl_->half_offset);
     double shell = 0;
     for (int i = 0; i < s.count; ++i) {
@@ -441,7 +454,7 @@ Material Simulator::material(const GeodeShape &s, Block point) const {
     return Material::Solid;
 }
 
-Simulation Simulator::generate(int cx, int cz, Terrain *terrain) {
+Simulation Simulator::generate(int cx, int cz, Terrain *terrain, bool split) {
     auto shape = describe(cx, cz);
     Simulation result;
     if (!shape.exists)
@@ -462,7 +475,9 @@ Simulation Simulator::generate(int cx, int cz, Terrain *terrain) {
     for (int i = 0; i < n; ++i) {
         auto &p = points[i];
         // 原版遇到第二个无效控制点时会取消整座晶洞。
-        if (terrain && !terrain->solid(result.x + p.x, result.y + p.y, result.z + p.z) && ++invalid > 1) {
+        // 谓词是 isAir() || is(geode_invalid_blocks)，而非简单的 !solid()：
+        // 基岩/水/岩浆都算无效，含水层固体算有效。
+        if (terrain && terrain->geode_invalid(result.x + p.x, result.y + p.y, result.z + p.z) && ++invalid > 1) {
             result.exists = false;
             result.rejected = true;
             return result;
@@ -484,8 +499,8 @@ Simulation Simulator::generate(int cx, int cz, Terrain *terrain) {
                 auto second = impl_->field.second.bound(b.x[x0], b.x[x1], b.y[y0], b.y[y1], b.z[z0], b.z[z1]);
                 // 26.3的float插值需要比double路径更宽的舍入边界。
                 double epsilon = impl_->float_noise ? 1e-5 : 1e-12;
-                noise_bounds[z][y][x] = {(first.lo + second.lo) * (5.0 / 6.0) * 0.05 - epsilon,
-                                         (first.hi + second.hi) * (5.0 / 6.0) * 0.05 + epsilon};
+                noise_bounds[z][y][x] = {(first.lo + second.lo) * kNoiseFactorDouble * 0.05 - epsilon,
+                                         (first.hi + second.hi) * kNoiseFactorDouble * 0.05 + epsilon};
             }
     double row_noise_hi[tiles][tiles];
     for (int z = 0; z < tiles; ++z)
@@ -531,7 +546,7 @@ Simulation Simulator::generate(int cx, int cz, Terrain *terrain) {
                                    ? impl_->field.sample263(result.x + x, result.y + y, result.z + z)
                                    : (impl_->field.first.sample(a.x[x + 16], a.y[y + 16], a.z[z + 16]) +
                                       impl_->field.second.sample(b.x[x + 16], b.y[y + 16], b.z[z + 16])) *
-                                         (5.0 / 6.0) * 0.05;
+                                         kNoiseFactorDouble * 0.05;
                 if (impl_->float_noise || impl_->legacy_shape) {
                     shell = 0;
                     for (int i = 0; i < n; ++i)
@@ -559,6 +574,137 @@ Simulation Simulator::generate(int cx, int cz, Terrain *terrain) {
         }
     if (terrain)
         terrain->filter_budding(result, cx, cz);
+    if (split) {
+        // A：在结构/基岩过滤之后再做归属划分，保证 own+spilled 与 budding 完全一致。
+        // 归属口径是"方块落在源区块内还是邻居区块内"：
+        //   own     —— 源区块自身范围，任何加载顺序下都必然落地；
+        //   spilled —— 跨到邻居区块，能否落地取决于邻居此刻是否已 Sealed。
+        // 注意写区半径 1 恰好覆盖晶洞 ±16 的全部足迹，所以半径本身不会丢弃方块；
+        // 真正造成差异的是邻居的 ProtoChunk/Imposter 状态。
+        result.own_budding.clear();
+        result.spilled_budding.clear();
+        for (auto p : result.budding) {
+            if (!in_write_zone(cx, cz, p.x, p.z)) {
+                // 超出写区半径：原版 setBlock 被 ensureCanWrite 拒绝，永不落地。
+                result.own_budding.push_back(p);
+                continue;
+            }
+            if (floor_div(p.x, 16) == cx && floor_div(p.z, 16) == cz)
+                result.own_budding.push_back(p);
+            else
+                result.spilled_budding.push_back(p);
+        }
+        // 顺序模型下的确定值由 resolve/apply_write_order 给出；这里先给上下界。
+        result.budding_bounds.lower = int(result.own_budding.size());
+        result.budding_bounds.upper = int(result.budding.size());
+        result.budding_bounds.value = result.budding_bounds.upper;
+    }
     return result;
+}
+
+bool Simulator::writable(ChunkWrite target) {
+    // ImposterProtoChunk(allowWrites=false).setBlockState 返回 null 且不落块；
+    // 只有 Terrain / Features 两种状态才是真正可写的 ProtoChunk。
+    return target != ChunkWrite::Sealed;
+}
+
+bool Simulator::in_write_zone(int source_x, int source_z, int x, int z) {
+    // ChunkPyramid: FEATURES 的 blockStateWriteRadius(1) + WorldGenRegion.isWithinWriteZone
+    // 用棋盘距离判定（Math.abs(dx) <= r && Math.abs(dz) <= r）。
+    int dx = floor_div(x, 16) - source_x, dz = floor_div(z, 16) - source_z;
+    return std::abs(dx) <= kWriteRadius && std::abs(dz) <= kWriteRadius;
+}
+
+namespace {
+// B：给定源区块、目标区块与顺序模型，返回目标区块此刻的可写状态。
+// 这是把"加载顺序"从硬编码常量变成显式参数的唯一入口。
+ChunkWrite neighbour_state(int source_x, int source_z, int nx, int nz, WriteOrder order) {
+    switch (order) {
+        case WriteOrder::Parallel:
+            // 同批次装饰：双方都是 ProtoChunk，写入可落地。
+            return ChunkWrite::Features;
+        case WriteOrder::Isolated:
+            // 只有本区块；任何跨区块目标都已不在生成窗口内。
+            return ChunkWrite::Sealed;
+        case WriteOrder::Lexicographic:
+            // 字典序大者后装饰：字典序小的邻居已完成本步骤，跨界写入丢失。
+            return (nx < source_x || (nx == source_x && nz <= source_z)) ? ChunkWrite::Sealed : ChunkWrite::Features;
+        case WriteOrder::ReverseLexicographic:
+            return (nx > source_x || (nx == source_x && nz >= source_z)) ? ChunkWrite::Sealed : ChunkWrite::Features;
+    }
+    return ChunkWrite::Sealed;
+}
+}
+
+Simulation apply_write_order(const Simulation &source, int cx, int cz, WriteOrder order) {
+    Simulation result = source;
+    if (!source.exists)
+        return result;
+    result.budding.clear();
+    for (auto p : source.own_budding)
+        result.budding.push_back(p);
+    for (auto p : source.spilled_budding) {
+        int nx = floor_div(p.x, 16), nz = floor_div(p.z, 16);
+        if (Simulator::writable(neighbour_state(cx, cz, nx, nz, order)))
+            result.budding.push_back(p);
+    }
+    result.budding_bounds.lower = int(source.own_budding.size());
+    result.budding_bounds.upper = int(source.budding.size());
+    result.budding_bounds.value = int(result.budding.size());
+    return result;
+}
+
+Simulation Simulator::resolve(int cx, int cz, WriteOrder order, Terrain *terrain) {
+    // 源区块自身的母岩归属：own 全部落地，spilled 取决于目标区块的可写状态。
+    auto source = generate(cx, cz, terrain, true);
+    auto result = source;
+    if (!source.exists)
+        return result;
+    result.budding.clear();
+    for (auto p : source.own_budding)
+        result.budding.push_back(p);
+    for (auto p : source.spilled_budding) {
+        int nx = floor_div(p.x, 16), nz = floor_div(p.z, 16);
+        if (writable(neighbour_state(cx, cz, nx, nz, order)))
+            result.budding.push_back(p);
+    }
+    result.budding_bounds.lower = int(source.own_budding.size());
+    result.budding_bounds.upper = int(source.budding.size());
+    result.budding_bounds.value = int(result.budding.size());
+    return result;
+}
+
+const char *write_order_name(WriteOrder order) {
+    switch (order) {
+        case WriteOrder::Parallel:
+            return "parallel";
+        case WriteOrder::Lexicographic:
+            return "lexicographic";
+        case WriteOrder::ReverseLexicographic:
+            return "reverse-lexicographic";
+        case WriteOrder::Isolated:
+            return "isolated";
+    }
+    return "parallel";
+}
+
+bool parse_write_order(const std::string &name, WriteOrder &order) {
+    if (name == "parallel") {
+        order = WriteOrder::Parallel;
+        return true;
+    }
+    if (name == "lexicographic") {
+        order = WriteOrder::Lexicographic;
+        return true;
+    }
+    if (name == "reverse-lexicographic") {
+        order = WriteOrder::ReverseLexicographic;
+        return true;
+    }
+    if (name == "isolated") {
+        order = WriteOrder::Isolated;
+        return true;
+    }
+    return false;
 }
 }

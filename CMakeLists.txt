@@ -31,14 +31,93 @@ add_library(terrain_biomes STATIC src/structure_layout/biome_bridge.c)
 target_link_libraries(terrain_biomes PUBLIC GeodeCubiomes::Biomes)
 add_library(geode_core STATIC
     src/geode.cpp src/search.cpp src/checkpoint.cpp src/coarse_gpu.cpp
-    src/terrain.cpp src/carver.cpp src/structures.cpp
+    src/terrain.cpp src/carver.cpp src/structures.cpp src/overwrites.cpp src/structure_cover.c
     src/structure_layout/layout.cpp src/structure_layout/climate263.cpp)
 add_library(MinecraftFinders::Geode ALIAS geode_core)
-target_include_directories(geode_core PUBLIC include src PRIVATE data src/structure_layout)
+target_include_directories(geode_core PUBLIC include src PRIVATE data src/structure_layout
+    # search.cpp 需要要塞/矿井覆盖模块的版本常量。
+    src/stronghold_118 src/mineshaft_gen)
 target_compile_features(geode_core PUBLIC cxx_std_20)
 target_link_libraries(geode_core PUBLIC terrain_biomes GeodeCubiomes::Java263 Threads::Threads)
 target_compile_options(terrain_biomes PRIVATE -O3 -fwrapv -ffp-contract=off -ffunction-sections -fdata-sections)
 target_compile_options(geode_core PRIVATE -O3 -Wall -Wextra -ffp-contract=off -ffunction-sections -fdata-sections)
+
+# ---------------------------------------------------------------------------
+# Stronghold End portal + layout simulation (1.18+).
+#
+# geode's cubiomes snapshot contains only the biomes/noise half (no finders.c,
+# no features/), so this module carries its own placement logic plus a vendored
+# copy of cubiomes' stronghold piece generator. It only consumes
+# GeodeCubiomes::Biomes, which geode already links.
+#
+# Nothing in geode_core depends on it; consumers link GeodeStronghold::Sh118.
+# ---------------------------------------------------------------------------
+option(GEODE_BUILD_STRONGHOLD "Build the 1.18+ stronghold portal simulator" ON)
+if(GEODE_BUILD_STRONGHOLD)
+    add_subdirectory(src/stronghold_118)
+    add_library(GeodeStronghold::Sh118 ALIAS geode_stronghold_118)
+
+    # 自测：用内置基准值校验布局、数量与 unionArea。
+    option(GEODE_BUILD_STRONGHOLD_SELFTEST "Build the stronghold module self-test" OFF)
+    if(GEODE_BUILD_STRONGHOLD_SELFTEST)
+        add_executable(sh118-selftest src/stronghold_118/sh118_selftest.c)
+        target_link_libraries(sh118-selftest PRIVATE geode_stronghold_118)
+
+        # 精确 Y 的专项验证（moveBelowSeaLevel 复现正确性）。
+        add_executable(sh118-ycheck src/stronghold_118/sh118_ycheck.c)
+        target_link_libraries(sh118-ycheck PRIVATE geode_stronghold_118 GeodeCubiomes::Biomes)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# 废弃矿井 (Mineshaft) 生成模块。
+#
+# 纯 C11 + Java LCG, 不需要 cubiomes(矿井生成不涉及噪声地形)。
+# 提供完整 piece 盒 / 入口盒 / 垂直偏移, 供 geode 需要矿井实际生成时调用。
+#
+# 注意: 见 src/mineshaft_gen/README.md —— 生成层与 Java 参考实现的对拍尚未
+# 通过, 在完成第三方校验前不要把它当权威数据。
+# ---------------------------------------------------------------------------
+option(GEODE_BUILD_MINESHAFT "Build the mineshaft generation module" ON)
+if(GEODE_BUILD_MINESHAFT)
+    add_subdirectory(src/mineshaft_gen)
+    add_library(GeodeMineshaft::Gen ALIAS geode_mineshaft)
+endif()
+
+# ---------------------------------------------------------------------------
+# 结构覆盖接口 (要塞 / 废弃矿井)。
+#
+# 只回答"某方块坐标是否被该结构写入", 供紫水晶主引擎排除母岩。
+# 约束见 docs/说明/要塞与矿井接入约束.md。
+#
+# 要塞无法给出精确世界 Y, 因此 covers() 按平面范围判定 —— 落在要塞平面内的
+# 紫晶洞母岩一律不得计入下限。
+# ---------------------------------------------------------------------------
+option(GEODE_BUILD_STRUCTURE_COVER "Build the structure cover interface" ON)
+if(GEODE_BUILD_STRUCTURE_COVER)
+    # 纯 C 库, 依赖要塞与矿井两个模块。geode_core 公开链接它,
+    # 这样 C++ 侧直接 include "structure_cover.h" 即可调用。
+    add_library(geode_structure_cover STATIC src/structure_cover.c)
+    add_library(GeodeStructureCover::Cover ALIAS geode_structure_cover)
+
+    target_include_directories(geode_structure_cover PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_features(geode_structure_cover PUBLIC c_std_11)
+    target_link_libraries(geode_structure_cover PUBLIC geode_stronghold_118 geode_mineshaft)
+    if(MSVC)
+        target_compile_options(geode_structure_cover PRIVATE /O2 /DNDEBUG)
+    else()
+        target_compile_options(geode_structure_cover PRIVATE
+            -O3 -DNDEBUG -fwrapv -ffp-contract=off)
+    endif()
+
+    target_link_libraries(geode_core PUBLIC geode_structure_cover)
+
+    option(GEODE_BUILD_COVER_SELFTEST "Build the structure cover self-test" OFF)
+    if(GEODE_BUILD_COVER_SELFTEST)
+        add_executable(cover-selftest src/structure_cover_selftest.c)
+        target_link_libraries(cover-selftest PRIVATE geode_structure_cover)
+    endif()
+endif()
 
 if(GEODE_BUILD_CLI)
     add_executable(geode-finder src/main.cpp src/protocol.cpp)
@@ -72,14 +151,14 @@ if(BUILD_TESTING AND GEODE_BUILD_CLI)
     else()
         target_link_options(geode-climate-check PRIVATE -static -static-libgcc -static-libstdc++)
     endif()
-    add_executable(geode-speed tools/speed_probe.cpp)
+    add_executable(geode-speed test/speed_probe.cpp)
     target_link_libraries(geode-speed PRIVATE geode_core)
     if(MSVC)
         set_property(TARGET geode-speed PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     else()
         target_link_options(geode-speed PRIVATE -static -static-libgcc -static-libstdc++)
     endif()
-    add_executable(geode-scan-check tools/scan_probe.cpp src/search.cpp)
+    add_executable(geode-scan-check test/scan_probe.cpp src/search.cpp)
     target_compile_definitions(geode-scan-check PRIVATE GEODE_SCAN_PROBE)
     target_link_libraries(geode-scan-check PRIVATE geode_core)
     if(MSVC)

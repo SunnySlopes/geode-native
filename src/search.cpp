@@ -2,6 +2,10 @@
 #include "terrain.hpp"
 #include "coarse_gpu.hpp"
 #include "checkpoint.hpp"
+#include "structure_cover.h"
+// 结构覆盖接口用到的版本 id：cubiomes 的 MC_* 与矿井模块的 MS_VERSION_*。
+#include "biomes.h"
+#include "mineshaft_gen.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -17,6 +21,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <climits>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace geode {
@@ -640,6 +646,23 @@ int Options::activity_radius() const {
     return modern ? std::min(simulation_distance, 31) : (tick_radius + 15) / 16;
 }
 
+bool Options::precise_available() const {
+    // A/B/C 精确复核对**全部受支持版本**开放（1.18 ~ 1.21.11、26.1 ~ 26.3）。
+    //
+    // 早先只对 generation >= 4（1.21.9+）开放，理由是"低版本未逐块校验"。
+    // 现在该前提已不成立：
+    //   * 要塞：1.18~1.19.2 用 legacy 重定位（与环几何共用随机流），
+    //           1.19.3+ 改用 fork 派生独立随机流；1.21.9 起 cherry_grove
+    //           进入 stronghold_biased_to。三条分界线都已在 sh118 内建模。
+    //   * 矿井：已逐条核对 1.19.2 / 1.20.1 / 1.21.5 / 1.21.11 的
+    //           MineshaftPieces，RNG 调用序列完全一致；输出盒只依赖
+    //           min_y=-64 / sea_level=63，1.18+ 未变。因此全版本同一套规则。
+    //   * 写入可见性（FEATURES 写区半径 1 + ImposterProtoChunk 丢弃）与
+    //     岩浆湖/地牢覆写同样不随版本变化。
+    // generation 仍用于紫水晶的形状/噪声细节（见 Simulator），那是另一层。
+    return true;
+}
+
 void expand_full_world(Options &o) {
     o.center_x = 0;
     o.center_z = 0;
@@ -855,10 +878,445 @@ Center evaluate(const Options &o, int px, int pz) {
                 if (active(o, px, pz, cx, cz))
                     ++out.geodes;
                 for (auto b : s.budding)
-                    if (in_world(floor_div(b.x, 16), floor_div(b.z, 16)) &&
-                        active_point(o, px, pz, b.x, b.z))
+                    if (in_world(floor_div(b.x, 16), floor_div(b.z, 16)) && active_point(o, px, pz, b.x, b.z))
                         ++out.budding;
             }
+    return out;
+}
+
+// structure_cover 用 cubiomes 的版本 id。这里把 Options.version 映射过去；
+// 只覆盖 geode 支持的 1.18..26.3，与 structure_cover 的要塞范围一致。
+// 返回 -1 表示该版本没有可用的结构模型（调用方据此跳过结构排除）。
+int structure_version_id(const std::string &version) {
+    int a = 0, b = 0, c = 0;
+    char dot1 = 0;
+    std::istringstream in(version);
+    if (!(in >> a >> dot1 >> b) || dot1 != '.')
+        return -1;
+    if (in.peek() == '.') {
+        in.get();
+        if (!(in >> c))
+            return -1;
+    }
+    if (a == 26) {
+        // 26.1 / 26.2 / 26.3 的要塞布局与 1.21.11 一致（见 stronghold_118/README.md）。
+        return (b >= 1 && b <= 3) ? MC_1_21_11 : -1;
+    }
+    if (a != 1)
+        return -1;
+    switch (b) {
+        case 18: return MC_1_18;
+        // 要塞生成的分界线在 1.19.3：1.18~1.19.2 的重定位直接消耗环几何的
+        // 随机流（legacy），1.19.3 起改为派生独立随机流。cubiomes 用
+        // MC_1_19_2 / MC_1_19_4 表示这两侧，因此 1.19.0~1.19.2 必须落到
+        // MC_1_19_2，不能和 1.19.3+ 共用 MC_1_19。
+        case 19: return c <= 2 ? MC_1_19_2 : MC_1_19;
+        case 20: return MC_1_20;
+        case 21:
+            if (c <= 4) return MC_1_21_4;
+            if (c <= 6) return MC_1_21_6;
+            if (c <= 9) return MC_1_21_9;
+            return MC_1_21_11;
+        default: return -1;
+    }
+}
+
+// mineshaft_gen 的版本枚举。
+//
+// 矿井生成已确认**全版本一致**：逐条核对 1.19.2 / 1.20.1 / 1.21.5 / 1.21.11
+// 的 MineshaftPieces，nextInt / nextBoolean / nextFloat / nextLong 的调用序列
+// 完全相同（只有类名与方法名变化）；输出盒只依赖 min_y=-64 与 sea_level=63，
+// 1.18 起未变。枚举里各版本取值相同，保留只是为了在日志里记录来源版本。
+static int msVersionId(const std::string &version) {
+    int a = 0, b = 0, c = 0;
+    char dot1 = 0;
+    std::istringstream in(version);
+    if (!(in >> a >> dot1 >> b) || dot1 != '.')
+        return -1;
+    if (in.peek() == '.') {
+        in.get();
+        if (!(in >> c))
+            return -1;
+    }
+    if (a == 26) {
+        if (b == 1) return MS_VERSION_26_1_2;
+        if (b == 2) return MS_VERSION_26_2;
+        if (b == 3) return MS_VERSION_26_3;
+        return -1;
+    }
+    if (a == 1 && b >= 18 && b <= 21)
+        return MS_VERSION_1_21_11;
+    return -1;
+}
+
+// 矿井覆盖是否参与下限计算。
+//
+// **已开启**。mineshaft_gen 已与原版 MineshaftPieces 逐 piece 对拍通过：
+// 9/9 个 seed/区块用例，piece 数、dy 与每个包围盒完全一致。
+// 对拍工具：tools/geode/src/mineshaft_gen/reference/
+//   MineshaftDump.java  —— 跑真版 Minecraft 类（非手写翻译）
+//   ms_dump.c           —— C 端对照工具
+//   crosscheck.py       —— 两者逐 piece 比对
+// 详情见 docs/说明/矿井对拍-执行记录.md。
+static constexpr bool kUseMineshaftCover = true;
+
+// 下限有两种口径，两个值都算、都输出，由上层决定怎么展示：
+//
+//   lower           严格下界。只承认「源区块自己写的」与「可证必然落地的跨界写入」，
+//                   任意全序都成立。数值偏小。
+//
+//   lower_realistic 常见加载口径。把「写入无晶洞的目标区块」也记为成功。
+//                   依据：同批加载时目标区块只到 FEATURES，尚未封存，写入会落地；
+//                   但如果玩家把区块分批加载/回访，目标区块可能先升到 FULL，
+//                   那时这些写入会被 ImposterProtoChunk 丢弃，真实值可跌回 lower。
+//                   因此它是"典型值"，**不是**下界。
+
+RefinedCenter refine_center(const Options &o, int px, int pz) {
+    return refine_center(o, px, pz, nullptr);
+}
+
+ChunkBuddingBounds chunk_budding_bounds(const Options &o, int chunkX, int chunkZ) {
+    ChunkBuddingBounds out;
+    if (!in_world(chunkX, chunkZ))
+        return out;
+
+    Simulator simulator(o.seed, o.generation);
+    std::unique_ptr<Terrain> owned;
+    Terrain *terrain = nullptr;
+    if (o.terrain) {
+        owned = std::make_unique<Terrain>(o.seed, o.generation);
+        // 地图上要显示"有多少会被顶掉"，因此这里始终启用覆盖模型。
+        owned->enable_overwrites(true);
+        terrain = owned.get();
+    }
+
+    auto s = simulator.generate(chunkX, chunkZ, terrain, true);
+    if (!s.exists)
+        return out;
+    out.exists = true;
+    out.max = static_cast<int>(s.budding.size());
+
+    const int scVer = structure_version_id(o.version);
+    const bool use_struct = scVer >= 0;
+
+    // 结构模型按"方块自身所在区块"取，并按区块缓存句柄。
+    struct CoverHandles {
+        ScStronghold *ss = nullptr;
+        ScMineshaft *ms = nullptr;
+    };
+    std::unordered_map<uint64_t, CoverHandles> coverCache;
+    auto chunkKey = [](int cx, int cz) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(cx)) << 32) |
+               static_cast<uint32_t>(cz);
+    };
+    auto coverFor = [&](int cxx, int czz) -> const CoverHandles & {
+        const uint64_t k = chunkKey(cxx, czz);
+        auto it = coverCache.find(k);
+        if (it != coverCache.end())
+            return it->second;
+        CoverHandles h;
+        if (use_struct) {
+            h.ss = sc_stronghold_for_chunk(o.seed, scVer, cxx, czz);
+            if (kUseMineshaftCover)
+                h.ms = sc_mineshaft_for_chunk(o.seed, msVersionId(o.version), cxx, czz);
+        }
+        return coverCache.emplace(k, h).first->second;
+    };
+    auto keep = [&](const Block &b) {
+        if (!in_world(floor_div(b.x, 16), floor_div(b.z, 16)))
+            return false;
+        if (terrain && terrain->overwritten_after(b.x, b.y, b.z))
+            return false;
+        if (use_struct) {
+            const CoverHandles &h = coverFor(floor_div(b.x, 16), floor_div(b.z, 16));
+            if (h.ss && sc_stronghold_covers(h.ss, b.x, b.y, b.z))
+                return false;
+            if (h.ms && sc_mineshaft_covers(h.ms, b.x, b.y, b.z))
+                return false;
+        }
+        return true;
+    };
+
+    // realistic：同批加载下全部跨界写入都落地，只需扣掉被覆写/顶掉的。
+    for (auto b : s.budding)
+        if (keep(b))
+            ++out.realistic;
+    // lower：只认源区块内的母岩（跨区块的可能被丢弃）。
+    for (auto b : s.own_budding)
+        if (keep(b))
+            ++out.lower;
+
+    for (auto &kv : coverCache) {
+        if (kv.second.ss) sc_stronghold_free(kv.second.ss);
+        if (kv.second.ms) sc_mineshaft_free(kv.second.ms);
+    }
+    return out;
+}
+
+RefinedCenter refine_center(const Options &o, int px, int pz, Terrain *shared) {
+    if (px < -30000000 || px >= 30000000 || pz < -30000000 || pz >= 30000000)
+        throw std::invalid_argument("Player position outside world");
+    RefinedCenter out;
+    out.x = px;
+    out.z = pz;
+    WriteOrder order = WriteOrder::Parallel;
+    // 低版本不支持精确搜索：强制退回 max（= 旧的最大取值口径）。
+    bool precise = o.precise_available();
+    bool bounded = precise && o.write_order != "max";
+    if (bounded && !parse_write_order(o.write_order, order))
+        throw std::invalid_argument("Unknown write order: " + o.write_order);
+
+    Simulator simulator(o.seed, o.generation);
+    // 复用调用方的 Terrain 可避免每次复核都重建噪声表与缓存。
+    std::unique_ptr<Terrain> owned;
+    Terrain *terrain = shared;
+    if (!terrain && o.terrain) {
+        owned = std::make_unique<Terrain>(o.seed, o.generation);
+        terrain = owned.get();
+    }
+    // C：只在 bounded（非 max）复核时启用覆盖模型。
+    bool use_overwrites = terrain && o.precise_overwrites && bounded;
+    if (use_overwrites)
+        terrain->enable_overwrites(true);
+
+    // 结构覆盖（要塞 / 矿井）：**与顺序模型无关**，始终参与。
+    // 结构用宽松替换谓词 (!features_cannot_replace)，因此能顶掉母岩；
+    // 被结构覆盖的母岩一律不计入任何口径。语义见
+    // docs/说明/要塞与矿井接入约束.md。
+    //
+    // 曾经只在 bounded（非 max）时启用，但搜索阶段现在**始终**在模拟里扣除
+    // 结构顶掉的母岩，若复核在 max 下不扣，estimate 就会比榜单值高，
+    // 触发 verifyMismatch 并让卡片显示两个不同的"上限"。
+    const int scVer = structure_version_id(o.version);
+    const bool use_structure_cover = scVer >= 0;
+
+    int pcx = floor_div(px, 16), pcz = floor_div(pz, 16), r = o.activity_radius() + 1;
+
+    auto chunkKey = [](int cx, int cz) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(cx)) << 32) |
+               static_cast<uint32_t>(cz);
+    };
+    auto in_view = [&](const Block &b) {
+        return in_world(floor_div(b.x, 16), floor_div(b.z, 16)) && active_point(o, px, pz, b.x, b.z);
+    };
+    auto covered = [&](const Block &b) {
+        return use_overwrites && terrain->overwritten_after(b.x, b.y, b.z);
+    };
+
+    // 结构覆盖：按**方块自身所在区块**建模型并缓存句柄。
+    // 用源区块的模型去测跨界块时覆盖盒可能不完整（少排除 → 下限偏高）。
+    struct CoverHandles {
+        ScStronghold *ss = nullptr;
+        ScMineshaft *ms = nullptr;
+    };
+    std::unordered_map<uint64_t, CoverHandles> coverCache;
+    auto coverFor = [&](int cxx, int czz) -> const CoverHandles & {
+        const uint64_t k = chunkKey(cxx, czz);
+        auto it = coverCache.find(k);
+        if (it != coverCache.end())
+            return it->second;
+        CoverHandles h;
+        if (use_structure_cover) {
+            h.ss = sc_stronghold_for_chunk(o.seed, scVer, cxx, czz);
+            if (kUseMineshaftCover)
+                h.ms = sc_mineshaft_for_chunk(o.seed, msVersionId(o.version), cxx, czz);
+        }
+        return coverCache.emplace(k, h).first->second;
+    };
+    auto struct_covered = [&](const Block &b) {
+        if (!use_structure_cover)
+            return false;
+        const CoverHandles &h = coverFor(floor_div(b.x, 16), floor_div(b.z, 16));
+        if (h.ss && sc_stronghold_covers(h.ss, b.x, b.y, b.z))
+            return true;
+        if (h.ms && sc_mineshaft_covers(h.ms, b.x, b.y, b.z))
+            return true;
+        return false;
+    };
+    // 下限原始集合与 own 使用完全相同的过滤器。
+    auto keep = [&](const Block &b) { return in_view(b) && !covered(b) && !struct_covered(b); };
+
+    // 单次几何计算：estimate / upper 直接累加，同时留下下限所需的集合。
+    struct ChunkRecord {
+        std::vector<Block> own;
+        std::vector<Block> spilled;
+    };
+    std::unordered_map<uint64_t, ChunkRecord> records;
+
+    for (int cz = pcz - r; cz <= pcz + r; ++cz)
+        for (int cx = pcx - r; cx <= pcx + r; ++cx) {
+            if (!in_world(cx, cz))
+                continue;
+            auto s = simulator.generate(cx, cz, terrain, true);
+            if (!s.exists)
+                continue;
+            if (active(o, px, pz, cx, cz) && !s.rejected)
+                ++out.geodes;
+
+            // estimate：不裁剪跨区块、不计覆写 → 原预测值（最大）。
+            // 但要塞覆盖与 Terrain 内的古城/试炼密室同属"地下结构顶替"，
+            // 已在模拟阶段扣掉，这里必须用同一口径，否则卡片上的原预估
+            // 会与搜索阶段的实际取值不一致。
+            for (auto b : s.budding)
+                if (in_view(b) && !struct_covered(b))
+                    ++out.estimate;
+
+            // upper：裁剪跨区块写入 + 计入覆写 + 扣掉要塞 → 带 &&bounded 的确定值
+            auto visible = apply_write_order(s, cx, cz, order);
+            for (auto b : visible.budding)
+                if (in_view(b) && !covered(b) && !struct_covered(b))
+                    ++out.upper;
+
+            // 没有母岩的区块不参与下限（records 只保留真正的晶洞区块）。
+            if (s.budding.empty())
+                continue;
+            ChunkRecord &rec = records[chunkKey(cx, cz)];
+            for (auto b : s.own_budding)
+                if (keep(b))
+                    rec.own.push_back(b);
+            if (bounded)
+                for (auto b : s.spilled_budding)
+                    if (keep(b))
+                        rec.spilled.push_back(b);
+        }
+
+    // ------------------------------------------------------------------
+    // 下限
+    //
+    // own_budding 必然落地：源区块装饰自己时目标就是自己，永远可写。
+    // ------------------------------------------------------------------
+    int own_total = 0;
+    for (auto &kv : records)
+        own_total += static_cast<int>(kv.second.own.size());
+    out.lower = own_total;
+    out.lower_own = own_total;
+    out.lower_realistic = own_total;
+
+    // 跨区块写入的精确最小化。
+    //
+    // 设 π 为"FEATURES 完成"的全序。母岩块 b 写在目标区块 T：
+    //   T 有晶洞且 b 也是 T 自己写的   → 必然存在（已计入 own）
+    //   T 是晶洞区块、另有写者 C        → 存在 ⟺ ∃C: π(C) < π(T)
+    //   T 不是晶洞区块                  → 最优全序可把 T 排到所有写者之前，必然丢失
+    // 所以只需在"参与跨区块写入的晶洞区块"上求最小者：
+    // 给它们选一个全序，使保住的块最少 —— 加权最小反馈弧集，用子集 DP 精确解。
+    // 规模超限则回退到 own-only（仍是合法下界）。
+    if (bounded && !records.empty()) {
+        constexpr int kMaxDpChunks = 16;  // 掩码宽度上限；超过则回退
+
+        auto packBlock = [](const Block &b) {
+            const uint64_t ux = static_cast<uint32_t>(b.x) & 0x3FFFFFFu;
+            const uint64_t uz = static_cast<uint32_t>(b.z) & 0x3FFFFFFu;
+            const uint64_t uy = static_cast<uint32_t>(b.y + 512) & 0x3FFu;
+            return (ux << 35) | (uz << 9) | uy;
+        };
+
+        // 目标区块自己的母岩集合：这些块已在 own 里计过，不再算跨界写入。
+        std::unordered_map<uint64_t, std::unordered_set<uint64_t>> ownSet;
+        for (auto &kv : records) {
+            if (kv.second.spilled.empty())
+                continue;
+            std::unordered_set<uint64_t> set;
+            set.reserve(kv.second.own.size() * 2 + 1);
+            for (auto &b : kv.second.own)
+                set.insert(packBlock(b));
+            ownSet.emplace(kv.first, std::move(set));
+        }
+
+        struct AtRisk {
+            uint64_t target;
+            uint64_t writer;
+            uint64_t block;
+        };
+        std::vector<AtRisk> atRisk;
+        std::unordered_set<uint64_t> involved;
+        int unknownTargetLands = 0;
+        for (auto &kv : records) {
+            for (auto &b : kv.second.spilled) {
+                const uint64_t tk = chunkKey(floor_div(b.x, 16), floor_div(b.z, 16));
+                if (records.find(tk) == records.end()) {
+                    // 目标区块没有任何已知内容（无晶洞）。
+                    // 同批加载时它只到 FEATURES、尚未封存，写入会落地；
+                    // 但若它先升到 FULL，写入会被丢弃 —— 所以只计入 realistic 口径。
+                    ++unknownTargetLands;
+                    continue;
+                }
+                const uint64_t bk = packBlock(b);
+                auto sit = ownSet.find(tk);
+                if (sit != ownSet.end() && sit->second.count(bk) != 0)
+                    continue;  // 已是目标区块自身的母岩
+                atRisk.push_back({tk, kv.first, bk});
+                involved.insert(tk);
+                involved.insert(kv.first);
+            }
+        }
+        out.lower = own_total;
+        out.lower_realistic = own_total + unknownTargetLands;
+
+        if (!atRisk.empty() && static_cast<int>(involved.size()) <= kMaxDpChunks) {
+            std::vector<uint64_t> keys(involved.begin(), involved.end());
+            std::sort(keys.begin(), keys.end());
+            std::unordered_map<uint64_t, int> idx;
+            idx.reserve(keys.size() * 2);
+            for (int i = 0; i < static_cast<int>(keys.size()); ++i)
+                idx.emplace(keys[i], i);
+
+            // (目标, 块) → 写者掩码；同一块被多个晶洞写入时按位或合并。
+            std::unordered_map<int, std::unordered_map<uint64_t, uint32_t>> maskByTarget;
+            for (auto &a : atRisk) {
+                const uint32_t bit = uint32_t(1) << idx[a.writer];
+                maskByTarget[idx[a.target]][a.block] |= bit;
+            }
+
+            const int g = static_cast<int>(keys.size());
+            std::vector<std::unordered_map<uint32_t, int>> maskCount(static_cast<size_t>(g));
+            for (auto &kv : maskByTarget)
+                for (auto &bm : kv.second)
+                    maskCount[static_cast<size_t>(kv.first)][bm.second] += 1;
+
+            // dp[S] = 已排好集合 S 时，被保住的跨界块数的最小值。
+            // 把 t 排在下一位时，T 中"写者已出现"的块会保住。
+            const size_t states = size_t(1) << g;
+            const int kInf = 0x3FFFFFFF;
+            std::vector<int> dp(states, kInf);
+            dp[0] = 0;
+            for (size_t S = 0; S < states; ++S) {
+                if (dp[S] >= kInf)
+                    continue;
+                for (int t = 0; t < g; ++t) {
+                    if (((S >> t) & 1u) != 0)
+                        continue;
+                    int cost = 0;
+                    for (auto &mc : maskCount[static_cast<size_t>(t)])
+                        if ((mc.first & static_cast<uint32_t>(S)) != 0)
+                            cost += mc.second;
+                    const size_t next = S | (size_t(1) << t);
+                    const int v = dp[S] + cost;
+                    if (v < dp[next])
+                        dp[next] = v;
+                }
+            }
+            out.lower = own_total + dp[states - 1];
+            out.lower_realistic = own_total + unknownTargetLands + dp[states - 1];
+            out.lower_dp = true;
+        }
+    }
+
+    // 句柄统一释放。
+    for (auto &kv : coverCache) {
+        if (kv.second.ss) sc_stronghold_free(kv.second.ss);
+        if (kv.second.ms) sc_mineshaft_free(kv.second.ms);
+    }
+
+    // isolated 模型假定所有邻居都已封存，那不是可实现的全序：相邻两个晶洞区块
+    // 必然一先一后，先者的跨界写入一定落地。因此把下限夹到 upper 以内，
+    // 保证 下限 ≤ 上限。
+    if (out.lower > out.upper)
+        out.lower = out.upper;
+
+    // 旧字段保持与 upper 一致，供现有调用方向后兼容。
+    out.budding = out.upper;
+    out.exact = bounded;
     return out;
 }
 
@@ -1446,6 +1904,15 @@ static Results search_impl(const Options &o, const ProgressFn &progress, const B
     auto simulate_reported = Clock::now();
     if (progress && saved.stats.resumed_simulation)
         progress("simulate", done, work.size(), uint64_t(scanned));
+    // 要塞覆盖：与 Terrain 内的古城/试炼密室的"地下结构顶替"同层，
+    // 因此在模拟阶段就把被要塞顶掉的母岩扣掉，而不是留到复核阶段。
+    // 句柄按区块缓存（每线程一份），因为同一区块会被多个候选重复触达。
+    const int shVer = structure_version_id(o.version);
+    const int msVer = msVersionId(o.version);
+    std::vector<std::unordered_map<uint64_t, ScStronghold *>> shCover(nthreads);
+    std::vector<uint64_t> shExcluded(nthreads, 0);
+    std::vector<std::unordered_map<uint64_t, ScMineshaft *>> msCover(nthreads);
+    std::vector<uint64_t> msExcluded(nthreads, 0);
     parallel(work.size(), nthreads, [&](size_t i, int id) {
         checkpoint();
         if (saved.simulation_done(work_keys[i]))
@@ -1456,6 +1923,20 @@ static Results search_impl(const Options &o, const ProgressFn &progress, const B
         uint64_t count = 0, rejected = 0;
         auto &weights = saved.enabled() ? delta : local_weights[id];
         auto &origin = saved.enabled() ? source : local_origins[id];
+        // 整片预判：这一片方块范围内没有任何要塞，就不必逐方块问覆盖。
+        // 要塞只有 128 座，绝大多数分区直接走这条捷径。
+        int tile_has_sh = 0;
+        if (shVer >= 0) {
+            int bx0 = INT32_MAX, bz0 = INT32_MAX, bx1 = INT32_MIN, bz1 = INT32_MIN;
+            for (auto row : work[i]) {
+                bx0 = std::min(bx0, row.lo * 16);
+                bx1 = std::max(bx1, row.hi * 16 + 15);
+                bz0 = std::min(bz0, row.z * 16);
+                bz1 = std::max(bz1, row.z * 16 + 15);
+            }
+            if (bx0 <= bx1)
+                tile_has_sh = sc_stronghold_may_reach(o.seed, shVer, bx0, bz0, bx1, bz1);
+        }
         for (auto row : work[i])
             for (int x = row.lo; x <= row.hi; ++x) {
                 if ((x - row.lo) % 32 == 0)
@@ -1469,8 +1950,41 @@ static Results search_impl(const Options &o, const ProgressFn &progress, const B
                     origin.push_back(key(x, row.z));
                 for (auto p : s.budding) {
                     int cx = floor_div(p.x, 16), cz = floor_div(p.z, 16);
-                    if (in_world(cx, cz))
-                        ++weights[o.custom() ? key(p.x, p.z) : key(cx, cz)];
+                    if (!in_world(cx, cz))
+                        continue;
+                    if (tile_has_sh) {
+                        const uint64_t ck = key(cx, cz);
+                        auto &cache = shCover[id];
+                        auto it = cache.find(ck);
+                        ScStronghold *ss;
+                        if (it == cache.end()) {
+                            ss = sc_stronghold_for_chunk(o.seed, shVer, cx, cz);
+                            cache.emplace(ck, ss);
+                        } else {
+                            ss = it->second;
+                        }
+                        if (ss && sc_stronghold_covers(ss, p.x, p.y, p.z)) {
+                            ++shExcluded[id];
+                            continue;
+                        }
+                    }
+                    if (msVer >= 0) {
+                        const uint64_t mk = key(cx, cz);
+                        auto &mcache = msCover[id];
+                        auto mit = mcache.find(mk);
+                        ScMineshaft *ms;
+                        if (mit == mcache.end()) {
+                            ms = sc_mineshaft_for_chunk(o.seed, msVer, cx, cz);
+                            mcache.emplace(mk, ms);
+                        } else {
+                            ms = mit->second;
+                        }
+                        if (ms && sc_mineshaft_covers(ms, p.x, p.y, p.z)) {
+                            ++msExcluded[id];
+                            continue;
+                        }
+                    }
+                    ++weights[o.custom() ? key(p.x, p.z) : key(cx, cz)];
                 }
             }
         if (saved.enabled())
@@ -1491,6 +2005,17 @@ static Results search_impl(const Options &o, const ProgressFn &progress, const B
             }
         }
     });
+    // 释放按线程缓存的结构句柄，并把被要塞顶掉的母岩数计入统计。
+    for (int id = 0; id < nthreads; ++id) {
+        for (auto &kv : shCover[id])
+            if (kv.second) sc_stronghold_free(kv.second);
+        shCover[id].clear();
+        out.stats.stronghold_excluded += shExcluded[id];
+        for (auto &kv : msCover[id])
+            if (kv.second) sc_mineshaft_free(kv.second);
+        msCover[id].clear();
+        out.stats.mineshaft_excluded += msExcluded[id];
+    }
     Weights weights = std::move(saved.weights), origins = std::move(saved.origins);
     if (saved.enabled()) {
         out.stats.simulated = saved.stats.simulated;
@@ -1712,6 +2237,41 @@ static Results search_impl(const Options &o, const ProgressFn &progress, const B
                 break;
         }
     }
+    // A/B/C：只对榜单前 refine_top 名做精确复核，避免全量搜索的额外开销。
+    // 默认 write_order="max" 时复核结果与既有取值一致（＝最大取值），不改变输出。
+    if (o.refine_top > 0 && !out.centers.empty()) {
+        WriteOrder order = WriteOrder::Parallel;
+        // 低版本不支持精确搜索：整段复核跳过，榜单保持搜索阶段的旧口径。
+        if (!o.precise_available()) {
+            out.precise_disabled = true;
+            out.write_order = "max";
+        } else {
+            bool bounded = o.write_order != "max";
+            if (bounded && !parse_write_order(o.write_order, order))
+                throw std::invalid_argument("Unknown write order: " + o.write_order);
+            size_t top = std::min(out.centers.size(), size_t(o.refine_top));
+            // 复核开销集中在每个中心重新模拟 (2r+1)^2 个区块，
+            // 与中心数线性相关，因此按线程并行。
+            int refine_threads = std::max(1, std::min<int>(o.threads, int(top)));
+            std::vector<RefinedCenter> results(top);
+            parallel(top, refine_threads, [&](size_t i, int) {
+                results[i] = refine_center(o, out.centers[i].x, out.centers[i].z);
+            });
+            // 关键：不改变原排名。只就地附加精确明细，
+            // out.centers 的顺序与未复核时完全一致。
+            out.refined.resize(top);
+            for (size_t i = 0; i < top; ++i) {
+                out.refined[i].estimate = results[i].estimate;
+                out.refined[i].upper = results[i].upper;
+                out.refined[i].lower = results[i].lower;
+                out.refined[i].lower_realistic = results[i].lower_realistic;
+                out.refined[i].lower_dp = results[i].lower_dp;
+                out.refined[i].lower_own = results[i].lower_own;
+                ++out.refined_count;
+            }
+            out.write_order = o.write_order;
+        }
+    }
     // 裁剪自检：被排除候选的上界必须严格低于最终榜单的最低分，否则说明保留的
     // 候选不够，可能漏掉本应进榜的热点。这里只判定并记录，不静默改动输出。
     if (two_pass) {
@@ -1769,4 +2329,4 @@ Results search(const Options &options, Control &control, const ProgressFn &progr
         return out;
     }
 }
-}
+}

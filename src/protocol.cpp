@@ -164,6 +164,16 @@ Options options(const Json &config) {
     o.coverage = p.value("coverage", std::string("game"));
     o.inner_radius = range_units::field(p, "innerRadius", "innerRadiusBlocks", 128);
     o.prefilter = p.value("prefilterLimit", 200000);
+    // A/B/C 精核：桌面端可指定顺序模型与复核条数。
+    // 缺省 max 时与原取值逐位一致。
+    o.write_order = p.value("writeOrder", std::string("max"));
+    if (o.write_order != "max" && o.write_order != "parallel" && o.write_order != "lexicographic" &&
+        o.write_order != "reverse-lexicographic" && o.write_order != "isolated")
+        throw std::invalid_argument("writeOrder must be max/parallel/lexicographic/reverse-lexicographic/isolated");
+    o.refine_top = p.value("refineTop", o.refine_top);
+    if (!o.precise_available() && o.write_order != "max")
+        throw std::invalid_argument("Precise search (writeOrder) requires Minecraft 1.21.11 or newer");
+    o.precise_overwrites = p.value("preciseOverwrites", o.precise_overwrites);
     o.scan_backend = p.value("scanBackend", std::string("auto"));
     if ((o.coverage != "game" && o.coverage != "circle" && o.coverage != "square") ||
         o.inner_radius > 60000000 || o.radius < 1 || o.radius > 60000000 || std::abs(int64_t(o.center_x)) > 29999999 ||
@@ -181,7 +191,7 @@ Options options(const Json &config) {
     return o;
 }
 
-Json candidate(const Options &o, int rank, Center c) {
+Json candidate(const Options &o, int rank, Center c, bool verified = false) {
     return {{"id", "geode-" + std::to_string(c.x) + "-" + std::to_string(c.z)},
             {"rank", rank},
             {"x", c.x},
@@ -194,14 +204,21 @@ Json candidate(const Options &o, int rank, Center c) {
             {"secondaryUnit", o.custom() ? "范围内晶洞" : "活跃晶洞"},
             {"bestPlayer", {{"x", c.x}, {"z", c.z}}},
             {"tpCommand", "/tp @s " + std::to_string(c.x) + " ~ " + std::to_string(c.z)},
-            {"verified", false}};
+            {"verified", verified}};
 }
 
 Json result_json(const Options &o, const Results &output, const std::string &job, double search_ms, double paused_ms) {
     Json candidates = Json::array();
     int rank = 0;
-    for (auto c : output.centers)
-        candidates.push_back(candidate(o, ++rank, c));
+    // 已核验：只有被精确顺序求解的前 refine_top 名才标注，
+    // 且 write_order=max 时不算核验（max 只是"最大取值"，不是真实加载顺序）。
+    bool order_resolved = o.write_order != "max";
+    int index = 0;
+    for (auto c : output.centers) {
+        bool verified = order_resolved && index < output.refined_count;
+        candidates.push_back(candidate(o, ++rank, c, verified));
+        ++index;
+    }
     auto &s = output.stats;
     Json bounds = {{"centerX", o.center_x},
                    {"centerZ", o.center_z},

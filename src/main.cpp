@@ -97,7 +97,8 @@ int run(int argc, char **argv) {
         std::map<std::string, std::string> args;
         for (size_t i = 0; i < command.size(); ++i) {
             const auto &k = command[i];
-            if (k == "--versions" || k == "--help" || k == "--jsonl" || k == "--no-checkpoint" || k == "--full-world")
+            if (k == "--versions" || k == "--help" || k == "--jsonl" || k == "--no-checkpoint" || k == "--full-world" ||
+                k == "--no-precise-overwrites")
                 args[k] = "true";
             else {
                 if (!k.starts_with("--") || i + 1 >= command.size())
@@ -119,6 +120,8 @@ int run(int argc, char **argv) {
                          "      --simulation-distance 10 --simulation-distance-unit chunks|blocks\n"
                          "      --min-geodes 1 --min-budding 1 --prefilter-limit 200000 --scan-backend auto|cpu|gpu\n"
                          "      --min-x X --max-x X --min-z Z --max-z Z: 精确四至矩形(闭区间；排名中心取中点)，--rect 用默认矩形\n"
+                         "精核: --refine-top 10 只复核榜单前N名；--write-order max|parallel|lexicographic|reverse-lexicographic|isolated\n"
+                         "      max(默认)取所有跨界写入都落地的上界，与既有取值一致；--no-precise-overwrites 关闭覆盖模型\n"
                          "      --scan-threads N: 粗筛线程数(1..256，模拟仍用--threads)；--checkpoint-region 区块: 断点聚合区域\n"
                          "桌面: --desktop (协议v3，stdin/stdout JSONL，不读取CLI配置)\n"
                          "开发: --model terrain|stone --samples 文件.json；--help只显示入口用法\n"
@@ -174,6 +177,20 @@ int run(int argc, char **argv) {
         o.min_budding = number("--min-budding", 1);
         o.prefilter = number("--prefilter-limit", 0);
         o.limit = number("--limit", 100);
+        // A/B/C 精确复核：默认只复核前 10 名，write-order=max 时与既有取值一致。
+        o.refine_top = number("--refine-top", 10);
+        o.write_order = text("--write-order", "max");
+        if (o.write_order != "max" && o.write_order != "parallel" && o.write_order != "lexicographic" &&
+            o.write_order != "reverse-lexicographic" && o.write_order != "isolated")
+            throw std::invalid_argument(
+                "Write order must be max, parallel, lexicographic, reverse-lexicographic or isolated");
+        o.precise_overwrites = args.find("--no-precise-overwrites") == args.end();
+        // 低版本（1.21.11 之前）未纳入精确搜索：一旦显式要求非 max 的顺序模型，
+        // 直接报错而不是静默回退，避免用户误以为已生效。
+        if (!o.precise_available() && o.write_order != "max")
+            throw std::invalid_argument(
+                "Precise search (--write-order) requires Minecraft 1.21.11 or newer; "
+                "earlier versions always use the maximum-value estimate");
         o.scan_backend = text("--scan-backend", "auto");
         if (o.scan_backend != "auto" && o.scan_backend != "cpu" && o.scan_backend != "gpu")
             throw std::invalid_argument("Scan backend must be auto, cpu or gpu");
@@ -232,6 +249,9 @@ int run(int argc, char **argv) {
                                                  "--min-z",
                                                  "--max-z",
                                                  "--rect",
+                                                 "--refine-top",
+                                                 "--write-order",
+                                                 "--no-precise-overwrites",
                                                  "--no-checkpoint"};
         for (auto &[k, v] : args)
             if (!supported.contains(k))
@@ -279,8 +299,31 @@ int run(int argc, char **argv) {
         // CLI保持results条目的字段结构，与samples和单点查询
         // 使用相同格式；只有顺序改为v3榜单规则。
         Json list = Json::array();
-        for (auto c : output.centers)
-            list.push_back(center_json(c));
+        for (size_t i = 0; i < output.centers.size(); ++i) {
+            Json item = center_json(output.centers[i]);
+            // 已核验：该条被精确复核（refine_top 覆盖到且顺序模型非 max）。
+            // max 语义是"最大取值"，并非真实加载顺序下的确定值，故不标核验。
+            bool refined = int(i) < output.refined_count;
+            // 三个口径（数值大小：estimate >= upper >= lower）：
+            //   estimatedBudding 保持不变（含未复核条目），
+            //   另外附加 upper/lower 供卡片显示区间。
+            if (int(i) < output.refined_count && int(i) < int(output.refined.size())) {
+                item["buddingUpper"] = output.refined[i].upper;
+                item["buddingLower"] = output.refined[i].lower;
+                item["buddingEstimate"] = output.refined[i].estimate;
+                // 下限是否用上跨区块精确最小化；false = 回退到 own-only。
+                item["buddingLowerExact"] = output.refined[i].lower_dp;
+                // 下限里 own-only 的基数（buddingLower - 它就是 DP 增量）。
+                item["buddingLowerOwn"] = output.refined[i].lower_own;
+                // 常见加载口径：把「写入无晶洞目标区块」也算成功。
+                // 典型值，不是下界（分批加载/回访时真实值可能跌回 buddingLower）。
+                item["buddingLowerRealistic"] = output.refined[i].lower_realistic;
+            }
+            bool exact = refined && o.write_order != "max";
+            item["verified"] = exact;
+            item["verification"] = exact ? "order-resolved" : "estimate";
+            list.push_back(item);
+        }
         auto &s = output.stats;
         Json result = {
             {"finder", "geode"},
@@ -298,6 +341,14 @@ int run(int argc, char **argv) {
             {"cancelled", output.cancelled},
             {"candidateChunkOptimization", "exact-integer"},
             {"rankingUnit", "distinct-hotspot"},
+            {"refinedCount", output.refined_count},
+            {"writeOrder", output.write_order},
+            // 精确复核对全部受支持版本开放；保留该字段供旧客户端兼容。
+            {"preciseSupported", o.precise_available()},
+            {"preciseDisabled", output.precise_disabled},
+            // 该版本实际使用的要塞/矿井结构模型版本（cubiomes MC_* id）。
+            // 1.19.2 及更早为 legacy 重定位，1.19.3+ 为派生随机流。
+            {"structureVersion", geode::structure_version_id(o.version)},
             {"parameters",
              {{"centerX", o.center_x},
               {"centerZ", o.center_z},
@@ -316,6 +367,10 @@ int run(int argc, char **argv) {
               {"minGeodes", o.min_geodes},
               {"minBudding", o.min_budding},
               {"prefilterLimit", o.prefilter},
+              {"refineTop", o.refine_top},
+              {"writeOrder", o.write_order},
+              {"preciseOverwrites", o.precise_overwrites},
+              {"preciseSupported", o.precise_available()},
               {"threads", o.threads},
               {"scanThreads", o.scan_threads > 0 ? o.scan_threads : o.threads},
               {"checkpointRegion", o.checkpoint_region},
@@ -344,6 +399,9 @@ int run(int argc, char **argv) {
         result["stats"]["twoPassKeptCandidates"] = s.two_pass_kept;
         result["stats"]["twoPassExcludedBound"] = s.two_pass_excluded_bound;
         result["stats"]["twoPassRetried"] = s.two_pass_retried;
+        // 模拟阶段因被要塞覆盖而扣掉的母岩数（"地下结构顶替"口径）。
+        result["stats"]["strongholdExcluded"] = s.stronghold_excluded;
+        result["stats"]["mineshaftExcluded"] = s.mineshaft_excluded;
         // 与桌面入口共用最终中心列表和导出函数，生成三份文件；随后
         // 直接输出同一个JSON对象，并保留csv/json兼容键。jsonl模式
         // 在写文件前标记done事件，使文件与标准输出保持一致。

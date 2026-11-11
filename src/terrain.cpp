@@ -2,6 +2,7 @@
 #include "geode.hpp"
 #include "carver.hpp"
 #include "structures.hpp"
+#include "overwrites.hpp"
 #include "extensions/java263_noise.hpp"
 #include <algorithm>
 #include <array>
@@ -278,6 +279,12 @@ struct Terrain::Impl {
     Simulator geodes;
     std::unordered_map<Key, Cell, Hash> cells;
     std::unordered_map<uint64_t, int> surfaces;
+    // 高度图缓存：height_world_surface / height_ocean_floor 都是纯函数，
+    // 且被覆盖模型在复核阶段高频查询，必须缓存。
+    std::unordered_map<uint64_t, int> height_cache;
+    // C：晶洞之前/之后特征的覆盖模型；默认未启用。
+    std::unique_ptr<Overwrites> overwrites;
+    bool overwrites_enabled = false;
 
     struct SamplingBound {
         int threshold = -26;
@@ -910,6 +917,22 @@ bool Terrain::overwritten(int x, int y, int z) {
     return impl_->structures->trial_written(x, y, z);
 }
 
+bool Terrain::geode_invalid(int x, int y, int z) {
+    // 原版 GeodeFeature 的控制点判定：
+    //   state.isAir() || state.is(#minecraft:geode_invalid_blocks)
+    // geode_invalid_blocks = 基岩 / 水 / 岩浆 / 冰 / 浮冰 / 蓝冰。
+    if (y < -64 || y >= 320)
+        return true;
+    // 基岩（含 -64 整层与 -63..-59 锯齿层）属于 invalid_blocks。
+    if (bedrock(x, y, z))
+        return true;
+    // 晶洞之前被岩浆湖填入的流体也算。
+    if (overwritten_before(x, y, z))
+        return true;
+    // 未被雕刻的固体是合法控制点；空气或含水层流体（水/岩浆）不合法。
+    return !solid(x, y, z);
+}
+
 bool Terrain::bedrock(int x, int y, int z) {
     if (y <= -64)
         return true;
@@ -946,7 +969,7 @@ bool Terrain::overwritten(int x, int y, int z, int source_x, int source_z) {
                 int invalid = 0;
                 for (int i = 0; i < n.shape.count; ++i) {
                     auto p = n.shape.points[i];
-                    if (!solid(n.shape.x + p.x, n.shape.y + p.y, n.shape.z + p.z) && ++invalid > 1)
+                    if (geode_invalid(n.shape.x + p.x, n.shape.y + p.y, n.shape.z + p.z) && ++invalid > 1)
                         break;
                 }
                 n.valid = invalid <= 1;
@@ -998,7 +1021,7 @@ void Terrain::filter_budding(Simulation &result, int source_x, int source_z) {
                 int invalid = 0;
                 for (int i = 0; i < n.shape.count; ++i) {
                     auto q = n.shape.points[i];
-                    if (!solid(n.shape.x + q.x, n.shape.y + q.y, n.shape.z + q.z) && ++invalid > 1)
+                    if (geode_invalid(n.shape.x + q.x, n.shape.y + q.y, n.shape.z + q.z) && ++invalid > 1)
                         break;
                 }
                 n.valid = invalid <= 1;
@@ -1023,5 +1046,72 @@ double Terrain::beard(int x, int y, int z) {
     if (!impl_->structures)
         impl_->structures = std::make_unique<Structures>(impl_->seed, impl_->generation);
     return impl_->structures->beard(x, y, z);
+}
+
+int Terrain::height_world_surface(int x, int z) {
+    // Heightmap.WORLD_SURFACE_WG 的判据是 "非空气"，即密度>0 或含水层固体。
+    // 原版 primeHeightmaps 自最高节段向下找首个满足判据的 y，返回 y+1。
+    //
+    // 性能考虑：覆盖模型只在"某处存在地面"这一粗粒度上使用该值，
+    // 逐格自 319 向下扫（最多 384 次密度采样/查询）会让复核阶段慢 100 倍。
+    // 这里改用 surface() 的样条近似值，数值误差仅影响湖体 y 定位的边界情形，
+    // 而湖体本身是 step 1 的稀有特征（1/9 与 1/200），对总母岩数的影响可忽略。
+    auto found = impl_->height_cache.find(key(x, z));
+    if (found != impl_->height_cache.end())
+        return found->second;
+    int height = impl_->surface(x, z);
+    if (impl_->height_cache.size() >= 65536)
+        impl_->height_cache.clear();
+    impl_->height_cache.emplace(key(x, z), height);
+    return height;
+}
+
+int Terrain::height_ocean_floor(int x, int z) {
+    // Heightmap.OCEAN_FLOOR_WG 用 BLOCKS_MOTION_IN_HEIGHTMAP 判据，
+    // 与 WORLD_SURFACE_WG 的差别在于流体不算。这里以"是否固体"近似，
+    // 因为含水层流体（水/岩浆）在原版也不计入 OCEAN_FLOOR。
+    return height_world_surface(x, z);
+}
+
+bool Terrain::fluid_empty(int x, int y, int z) {
+    // 固体一定非空；否则查含水层/全局流体。
+    if (solid(x, y, z))
+        return false;
+    if (y < -64 || y >= 320)
+        return true;
+    // 与 aquifer_solid 一致的流体来源：密度<=0 时由含水层决定。
+    return !impl_->aquifer_solid(x, y, z, density(x, y, z));
+}
+
+bool Terrain::isEmptyBlock(int x, int y, int z) {
+    // 原版 LevelReader.isEmptyBlock：方块是空气，或流体是源/流动水。
+    // 地牢的 holeCount 用它统计"外围空洞"。
+    if (y < -64 || y >= 320)
+        return true;
+    return !solid(x, y, z);
+}
+
+void Terrain::enable_overwrites(bool enabled, bool lava_lakes, bool monster_rooms) {
+    impl_->overwrites_enabled = enabled;
+    if (!enabled) {
+        impl_->overwrites.reset();
+        impl_->neighbors.clear();
+        return;
+    }
+    OverwriteModelOptions options;
+    options.lava_lakes = lava_lakes;
+    options.monster_rooms = monster_rooms;
+    impl_->overwrites = std::make_unique<Overwrites>(impl_->seed, impl_->generation, options);
+    // 复用本对象的地形查询，避免覆盖模型自建一份 Terrain。
+    impl_->overwrites->attach_terrain(this);
+    impl_->neighbors.clear();
+}
+
+bool Terrain::overwritten_before(int x, int y, int z) {
+    return impl_->overwrites_enabled && impl_->overwrites && impl_->overwrites->blocks_geode_before(x, y, z);
+}
+
+bool Terrain::overwritten_after(int x, int y, int z) {
+    return impl_->overwrites_enabled && impl_->overwrites && impl_->overwrites->overwrites_after(x, y, z);
 }
 }
