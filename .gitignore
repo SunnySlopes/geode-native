@@ -1,8 +1,7 @@
 build/
 results/
-__pycache__/
 logs/
-docs/记录/
+test/
 tests/
-/tools/
+docs/记录/
 docs/计划/
